@@ -1,0 +1,83 @@
+[
+  {
+    "project_key": "workspace-7",
+    "trace_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "workspace_id": 7,
+    "event_name": "function_execute",
+    "obj_type": "function",
+    "obj_name": "sum_loop",
+    "status": "success",
+    "error_type": "",
+    "started_at_ms": 1791885005000,
+    "duration_ms": 402.75,
+    "span_count": 3,
+    "bytes": 1285,
+    "dropped_spans": 0,
+    "spans": [
+      {
+        "trace_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "span_id": "6e6e6e6e6e6e6e01",
+        "parent_span_id": "6e6e6e6e6e6e6e00",
+        "timestamp": "2026-10-13T09:50:05.010Z",
+        "attributes": {
+          "event_name": "statement_execute",
+          "status": "success",
+          "duration_ms": 0.5,
+          "statement": "mvp:math_add",
+          "_xsid": "a1",
+          "depth": 2,
+          "index": 1,
+          "phase": "main",
+          "as": "total"
+        },
+        "data": {
+          "result": 1
+        }
+      },
+      {
+        "trace_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "span_id": "6e6e6e6e6e6e6e02",
+        "parent_span_id": "6e6e6e6e6e6e6e00",
+        "timestamp": "2026-10-13T09:50:05.040Z",
+        "attributes": {
+          "event_name": "statement_execute",
+          "status": "success",
+          "duration_ms": 310.5,
+          "statement": "mvp:math_add",
+          "_xsid": "a1",
+          "depth": 2,
+          "index": 51,
+          "phase": "main",
+          "aggregate": true,
+          "count": 950,
+          "total_duration_ms": 285.25,
+          "error_count": 0,
+          "completed": true
+        },
+        "data": {}
+      },
+      {
+        "trace_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "span_id": "6e6e6e6e6e6e6e00",
+        "parent_span_id": "",
+        "timestamp": "2026-10-13T09:50:05.000Z",
+        "attributes": {
+          "event_name": "function_execute",
+          "status": "success",
+          "duration_ms": 402.75,
+          "workspace_id": "7",
+          "branch_id": "0",
+          "obj_type": "function",
+          "obj_id": 30,
+          "obj_name": "sum_loop",
+          "input_size": 2,
+          "result_size": 3
+        },
+        "data": {
+          "input": {},
+          "result": 1000
+        }
+      }
+    ]
+  }
+]

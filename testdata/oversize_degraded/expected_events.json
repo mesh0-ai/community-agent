@@ -1,0 +1,16 @@
+[
+  {
+    "project_key": "workspace-7",
+    "trace_id": "7d2a9c4e6f1b3d5a8e0c2b4d6f8a0c1e",
+    "span_id": "4c4c4c4c4c4c4c00",
+    "workspace_id": 7,
+    "event_name": "query_execute",
+    "obj_type": "query",
+    "obj_name": "/export",
+    "status": "error",
+    "error_type": "xano\\exception\\Runtime",
+    "duration_ms": 12.5,
+    "aggregate_count": 1,
+    "ts_ms": 1791885003000
+  }
+]

@@ -1,0 +1,30 @@
+[
+  {
+    "project_key": "workspace-7",
+    "trace_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "span_id": "6e6e6e6e6e6e6e00",
+    "workspace_id": 7,
+    "event_name": "function_execute",
+    "obj_type": "function",
+    "obj_name": "sum_loop",
+    "status": "success",
+    "error_type": "",
+    "duration_ms": 402.75,
+    "aggregate_count": 1,
+    "ts_ms": 1791885005000
+  },
+  {
+    "project_key": "workspace-7",
+    "trace_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "span_id": "6e6e6e6e6e6e6e02",
+    "workspace_id": 7,
+    "event_name": "statement_execute",
+    "obj_type": "",
+    "obj_name": "",
+    "status": "success",
+    "error_type": "",
+    "duration_ms": 310.5,
+    "aggregate_count": 950,
+    "ts_ms": 1791885005040
+  }
+]
