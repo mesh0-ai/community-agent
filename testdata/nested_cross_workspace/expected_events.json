@@ -1,0 +1,30 @@
+[
+  {
+    "project_key": "workspace-7",
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "span_id": "1a1a1a1a1a1a1a00",
+    "workspace_id": 7,
+    "event_name": "query_execute",
+    "obj_type": "query",
+    "obj_name": "/audit",
+    "status": "success",
+    "error_type": "",
+    "duration_ms": 30,
+    "aggregate_count": 1,
+    "ts_ms": 1791885001000
+  },
+  {
+    "project_key": "workspace-9",
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "span_id": "2a2a2a2a2a2a2a00",
+    "workspace_id": 9,
+    "event_name": "function_execute",
+    "obj_type": "function",
+    "obj_name": "record_audit",
+    "status": "success",
+    "error_type": "",
+    "duration_ms": 4.5,
+    "aggregate_count": 1,
+    "ts_ms": 1791885001021
+  }
+]

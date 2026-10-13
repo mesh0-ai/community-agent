@@ -1,0 +1,16 @@
+[
+  {
+    "project_key": "workspace-7",
+    "trace_id": "5c1e0b7d2f3a4e6b8c9d0a1b2c3d4e5f",
+    "span_id": "3b3b3b3b3b3b3b00",
+    "workspace_id": 7,
+    "event_name": "task_execute",
+    "obj_type": "task",
+    "obj_name": "nightly_sync",
+    "status": "success",
+    "error_type": "",
+    "duration_ms": 38250,
+    "aggregate_count": 1,
+    "ts_ms": 1791885002000
+  }
+]

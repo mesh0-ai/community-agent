@@ -1,0 +1,153 @@
+[
+  {
+    "project_key": "workspace-7",
+    "trace_id": "0af7651916cd43dd8448eb211c80319c",
+    "workspace_id": 7,
+    "event_name": "query_execute",
+    "obj_type": "query",
+    "obj_name": "/users/{id}",
+    "status": "success",
+    "error_type": "",
+    "started_at_ms": 1791885000000,
+    "duration_ms": 42.125,
+    "span_count": 5,
+    "bytes": 2520,
+    "dropped_spans": 0,
+    "spans": [
+      {
+        "trace_id": "0af7651916cd43dd8448eb211c80319c",
+        "span_id": "b7ad6b7169203331",
+        "parent_span_id": "00f067aa0ba902b7",
+        "timestamp": "2026-10-13T09:50:00.005Z",
+        "attributes": {
+          "event_name": "statement_execute",
+          "status": "success",
+          "duration_ms": 3.5,
+          "statement": "mvp:dbo_view",
+          "_xsid": "x1",
+          "depth": 1,
+          "index": 1,
+          "phase": "main",
+          "as": "user",
+          "input_size": 12,
+          "result_size": 41
+        },
+        "data": {
+          "input": {
+            "id": 1
+          },
+          "result": {
+            "id": 1,
+            "email": "ada@example.test"
+          }
+        }
+      },
+      {
+        "trace_id": "0af7651916cd43dd8448eb211c80319c",
+        "span_id": "c3a1e2d4f5b60718",
+        "parent_span_id": "e1d2c3b4a5968778",
+        "timestamp": "2026-10-13T09:50:00.012Z",
+        "attributes": {
+          "event_name": "statement_execute",
+          "status": "success",
+          "duration_ms": 0.25,
+          "statement": "mvp:set_var",
+          "_xsid": "x3",
+          "depth": 1,
+          "index": 1,
+          "phase": "main",
+          "as": "greeting"
+        },
+        "data": {
+          "result": "hello"
+        }
+      },
+      {
+        "trace_id": "0af7651916cd43dd8448eb211c80319c",
+        "span_id": "e1d2c3b4a5968778",
+        "parent_span_id": "d4c3b2a190807060",
+        "timestamp": "2026-10-13T09:50:00.011Z",
+        "attributes": {
+          "event_name": "function_execute",
+          "status": "success",
+          "duration_ms": 18.75,
+          "workspace_id": "7",
+          "branch_id": "0",
+          "obj_type": "function",
+          "obj_id": 12,
+          "obj_name": "get_greeting",
+          "input_size": 2,
+          "result_size": 7
+        },
+        "data": {
+          "input": {},
+          "result": "hello"
+        }
+      },
+      {
+        "trace_id": "0af7651916cd43dd8448eb211c80319c",
+        "span_id": "d4c3b2a190807060",
+        "parent_span_id": "00f067aa0ba902b7",
+        "timestamp": "2026-10-13T09:50:00.010Z",
+        "attributes": {
+          "event_name": "statement_execute",
+          "status": "success",
+          "duration_ms": 20.25,
+          "statement": "mvp:function_run",
+          "_xsid": "x2",
+          "depth": 1,
+          "index": 2,
+          "phase": "main",
+          "as": "greeting"
+        },
+        "data": {
+          "result": "hello"
+        }
+      },
+      {
+        "trace_id": "0af7651916cd43dd8448eb211c80319c",
+        "span_id": "00f067aa0ba902b7",
+        "parent_span_id": "",
+        "timestamp": "2026-10-13T09:50:00.000Z",
+        "attributes": {
+          "event_name": "query_execute",
+          "status": "success",
+          "duration_ms": 42.125,
+          "workspace_id": "7",
+          "branch_id": "0",
+          "obj_type": "query",
+          "obj_id": 3,
+          "obj_name": "/users/{id}",
+          "verb": "GET",
+          "http_status": 200,
+          "uri": "/api:abc/users/1",
+          "ip": "10.0.0.1",
+          "app_id": 2,
+          "query_id": 3,
+          "input_size": 8,
+          "output_size": 41,
+          "request_headers_size": 64,
+          "response_headers_size": 40,
+          "middleware_size": 2
+        },
+        "data": {
+          "input": {
+            "id": 1
+          },
+          "output": {
+            "id": 1,
+            "email": "ada@example.test"
+          },
+          "request_headers": [
+            "Accept: application/json",
+            "Authorization: *** REMOVED ***"
+          ],
+          "response_headers": [
+            "Content-Type: application/json"
+          ],
+          "middleware": {}
+        }
+      }
+    ]
+  }
+]
