@@ -71,15 +71,17 @@ func fixtureCases() []fixtureCase {
 			},
 		},
 		{
-			// A run in tenant workspace 1 calls a function in tenant
-			// workspace 2. Each workspace's spans travel under its own
+			// A run in workspace 7 calls a function in workspace 9 (a nested
+			// workspace run). Each workspace's spans travel under its own
 			// project key, so the trace id is shared and the rows are not.
+			// Instance workspaces, not tenant ones: a tenant's key is always
+			// `tenant-<name>-workspace-1`, so PHP never produces two of them.
 			name: "nested_cross_workspace",
 			datagrams: []fixtureDatagram{
-				{"tenant-acme-workspace-2", tokValid, `{"timestamp":"2026-10-13T09:50:01.022Z","trace_id":"` + traceNested + `","span_id":"2a2a2a2a2a2a2a01","parent_span_id":"2a2a2a2a2a2a2a00","attributes":{"event_name":"statement_execute","status":"success","duration_ms":1.5,"statement":"mvp:dbo_add","_xsid":"n2","depth":1,"index":1,"phase":"main","as":"row"},"data":{"result":{"id":5}}}`},
-				{"tenant-acme-workspace-2", tokValid, `{"timestamp":"2026-10-13T09:50:01.021Z","trace_id":"` + traceNested + `","span_id":"2a2a2a2a2a2a2a00","parent_span_id":"1a1a1a1a1a1a1a01","attributes":{"event_name":"function_execute","status":"success","duration_ms":4.5,"workspace_id":"2","branch_id":"0","obj_type":"function","obj_id":4,"obj_name":"record_audit"},"data":{"input":{},"result":{"id":5}}}`},
-				{"tenant-acme-workspace-1", tokValid, `{"timestamp":"2026-10-13T09:50:01.020Z","trace_id":"` + traceNested + `","span_id":"1a1a1a1a1a1a1a01","parent_span_id":"1a1a1a1a1a1a1a00","attributes":{"event_name":"statement_execute","status":"success","duration_ms":6,"statement":"mvp:function_run","_xsid":"n1","depth":1,"index":1,"phase":"main","as":"audit"},"data":{"result":{"id":5}}}`},
-				{"tenant-acme-workspace-1", tokValid, `{"timestamp":"2026-10-13T09:50:01.000Z","trace_id":"` + traceNested + `","span_id":"1a1a1a1a1a1a1a00","attributes":{"event_name":"query_execute","status":"success","duration_ms":30,"workspace_id":"1","branch_id":"0","obj_type":"query","obj_id":9,"obj_name":"/audit","verb":"POST","http_status":200},"data":{"input":{},"output":{"ok":true}}}`},
+				{"workspace-9", tokValid, `{"timestamp":"2026-10-13T09:50:01.022Z","trace_id":"` + traceNested + `","span_id":"2a2a2a2a2a2a2a01","parent_span_id":"2a2a2a2a2a2a2a00","attributes":{"event_name":"statement_execute","status":"success","duration_ms":1.5,"statement":"mvp:dbo_add","_xsid":"n2","depth":1,"index":1,"phase":"main","as":"row"},"data":{"result":{"id":5}}}`},
+				{"workspace-9", tokValid, `{"timestamp":"2026-10-13T09:50:01.021Z","trace_id":"` + traceNested + `","span_id":"2a2a2a2a2a2a2a00","parent_span_id":"1a1a1a1a1a1a1a01","attributes":{"event_name":"function_execute","status":"success","duration_ms":4.5,"workspace_id":"9","branch_id":"0","obj_type":"function","obj_id":4,"obj_name":"record_audit"},"data":{"input":{},"result":{"id":5}}}`},
+				{"workspace-7", tokValid, `{"timestamp":"2026-10-13T09:50:01.020Z","trace_id":"` + traceNested + `","span_id":"1a1a1a1a1a1a1a01","parent_span_id":"1a1a1a1a1a1a1a00","attributes":{"event_name":"statement_execute","status":"success","duration_ms":6,"statement":"mvp:function_run","_xsid":"n1","depth":1,"index":1,"phase":"main","as":"audit"},"data":{"result":{"id":5}}}`},
+				{"workspace-7", tokValid, `{"timestamp":"2026-10-13T09:50:01.000Z","trace_id":"` + traceNested + `","span_id":"1a1a1a1a1a1a1a00","attributes":{"event_name":"query_execute","status":"success","duration_ms":30,"workspace_id":"7","branch_id":"0","obj_type":"query","obj_id":9,"obj_name":"/audit","verb":"POST","http_status":200},"data":{"input":{},"output":{"ok":true}}}`},
 			},
 		},
 		{

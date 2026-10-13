@@ -1,8 +1,8 @@
 [
   {
-    "project_key": "tenant-acme-workspace-1",
+    "project_key": "workspace-7",
     "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
-    "workspace_id": 1,
+    "workspace_id": 7,
     "event_name": "query_execute",
     "obj_type": "query",
     "obj_name": "/audit",
@@ -45,7 +45,7 @@
           "event_name": "query_execute",
           "status": "success",
           "duration_ms": 30,
-          "workspace_id": "1",
+          "workspace_id": "7",
           "branch_id": "0",
           "obj_type": "query",
           "obj_id": 9,
@@ -63,9 +63,9 @@
     ]
   },
   {
-    "project_key": "tenant-acme-workspace-2",
+    "project_key": "workspace-9",
     "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
-    "workspace_id": 2,
+    "workspace_id": 9,
     "event_name": "function_execute",
     "obj_type": "function",
     "obj_name": "record_audit",
@@ -108,7 +108,7 @@
           "event_name": "function_execute",
           "status": "success",
           "duration_ms": 4.5,
-          "workspace_id": "2",
+          "workspace_id": "9",
           "branch_id": "0",
           "obj_type": "function",
           "obj_id": 4,
