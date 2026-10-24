@@ -12,7 +12,8 @@ import (
 //	Submit ──in──▶ assembler loop ──writeCh──▶ writer loop ──▶ DB
 //
 // Submit never blocks. Both queues are bounded and their overflow is counted
-// as queue_full.
+// as queue_full. The writer loop writes whatever groups are queued together,
+// several per transaction (Config.BatchGroups, Config.BatchBytes).
 type Pipeline struct {
 	cfg      Config
 	counters *Counters
@@ -171,9 +172,52 @@ func (p *Pipeline) enqueueWrite(g Group) {
 	}
 }
 
+// writeLoop writes the queued groups in batches: it waits for one group,
+// then takes whatever else is already queued, up to BatchGroups groups and
+// BatchBytes span bytes, and writes them in one transaction. It never waits
+// for a batch to fill, so a quiet pipeline still writes each group at once.
 func (p *Pipeline) writeLoop() {
 	defer close(p.writerDone)
-	for g := range p.writeCh {
-		_ = p.writer.Write(p.writerCtx, g)
+	var carry *Group
+	for {
+		var first Group
+		if carry != nil {
+			first, carry = *carry, nil
+		} else {
+			g, ok := <-p.writeCh
+			if !ok {
+				return
+			}
+			first = g
+		}
+		batch := []Group{first}
+		size := groupSize(first)
+	collect:
+		for len(batch) < p.cfg.BatchGroups {
+			select {
+			case g, ok := <-p.writeCh:
+				if !ok {
+					break collect
+				}
+				if size+groupSize(g) > p.cfg.BatchBytes {
+					carry = &g
+					break collect
+				}
+				batch = append(batch, g)
+				size += groupSize(g)
+			default:
+				break collect
+			}
+		}
+		_ = p.writer.WriteBatch(p.writerCtx, batch)
 	}
+}
+
+// groupSize is the summed byte size of a group's spans.
+func groupSize(g Group) int64 {
+	var n int64
+	for _, s := range g.Spans {
+		n += s.Size()
+	}
+	return n
 }

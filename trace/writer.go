@@ -51,24 +51,74 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 // missing table retry with backoff until ctx ends; a data error drops the
 // group. Either drop counts every span of the group as write_error.
 func (w *Writer) Write(ctx context.Context, g Group) error {
+	return w.WriteBatch(ctx, []Group{g})
+}
+
+// WriteBatch stores groups, in order, in as few transactions as it can:
+// normally one for the whole batch. Each group is merged exactly as Write
+// merges it, and a later group for the same key sees the earlier one's
+// writes, so the rows are the same as writing the groups one by one.
+//
+// One group's data error does not cost the others: the batch is rolled
+// back, the groups before the failing one are written again on their own,
+// the failing group is dropped (write_error) and the rest carry on. A data
+// error that cannot be pinned on one group (a failed commit) writes each
+// group in its own transaction. A transient error or a missing table retries
+// the whole batch with backoff until ctx ends, and then every group still
+// unwritten counts as write_error. The result joins the errors of every
+// dropped group; nil means all were stored.
+func (w *Writer) WriteBatch(ctx context.Context, groups []Group) error {
+	pending := append([]Group(nil), groups...)
+	var errs []error
 	delay := backoffStart
-	for {
-		res, err := w.writeOnce(ctx, g)
+	for len(pending) > 0 {
+		if cerr := ctx.Err(); cerr != nil {
+			errs = append(errs, w.abandon(pending, cerr, nil))
+			break
+		}
+		results, failed, err := w.writeBatchOnce(ctx, pending)
 		if err == nil {
-			w.counters.TracesWritten.Add(1)
-			w.counters.StoredSpans.Add(uint64(res.stored))
-			w.counters.CapDropped.Add(uint64(res.capDropped))
-			w.counters.Duplicate.Add(uint64(res.duplicate))
-			return nil
+			for _, res := range results {
+				w.counters.TracesWritten.Add(1)
+				w.counters.StoredSpans.Add(uint64(res.stored))
+				w.counters.CapDropped.Add(uint64(res.capDropped))
+				w.counters.Duplicate.Add(uint64(res.duplicate))
+			}
+			break
+		}
+		if cerr := ctx.Err(); cerr != nil {
+			errs = append(errs, w.abandon(pending, cerr, err))
+			break
 		}
 		kind := ErrData
 		if !errors.Is(err, errCorruptRow) {
 			kind = w.db.Classify(err)
 		}
 		if kind == ErrData {
+			if failed < 0 && len(pending) > 1 {
+				for _, g := range pending {
+					if gerr := w.WriteBatch(ctx, []Group{g}); gerr != nil {
+						errs = append(errs, gerr)
+					}
+				}
+				break
+			}
+			if failed < 0 {
+				failed = 0
+			}
+			if failed > 0 {
+				// These wrote fine before the failing group; store them now so
+				// a run of bad groups cannot make the good ones go round again.
+				if perr := w.WriteBatch(ctx, pending[:failed]); perr != nil {
+					errs = append(errs, perr)
+				}
+			}
+			g := pending[failed]
 			w.counters.WriteError.Add(uint64(len(g.Spans)))
 			w.log.Warn("trace write dropped", "project", g.Key.ProjectKey, "trace_id", g.Key.TraceID, "spans", len(g.Spans), "err", err)
-			return err
+			errs = append(errs, err)
+			pending = pending[failed+1:]
+			continue
 		}
 		if kind == ErrTableMissing {
 			w.counters.TableMissing.Add(1)
@@ -77,24 +127,42 @@ func (w *Writer) Write(ctx context.Context, g Group) error {
 			w.log.Warn("transient trace write error; retrying", "err", err, "delay", delay)
 		}
 		if serr := w.Sleep(ctx, delay); serr != nil {
-			w.counters.WriteError.Add(uint64(len(g.Spans)))
-			return fmt.Errorf("trace write abandoned: %w (last error: %v)", serr, err)
+			errs = append(errs, w.abandon(pending, serr, err))
+			break
 		}
 		delay *= 2
 		if delay > backoffMax {
 			delay = backoffMax
 		}
 	}
+	return errors.Join(errs...)
+}
+
+// abandon counts every span of groups as write_error: ctx ended (the
+// shutdown grace ran out) before they could be stored.
+func (w *Writer) abandon(groups []Group, cause, last error) error {
+	spans := 0
+	for _, g := range groups {
+		spans += len(g.Spans)
+	}
+	w.counters.WriteError.Add(uint64(spans))
+	if last == nil {
+		return fmt.Errorf("trace write abandoned: %w", cause)
+	}
+	return fmt.Errorf("trace write abandoned: %w (last error: %v)", cause, last)
 }
 
 type writeResult struct {
 	stored, capDropped, duplicate int
 }
 
-func (w *Writer) writeOnce(ctx context.Context, g Group) (res writeResult, err error) {
+// writeBatchOnce writes groups in one transaction. On error, failed is the
+// index of the group whose statement failed, or -1 when the error is not
+// one group's (Begin, Commit).
+func (w *Writer) writeBatchOnce(ctx context.Context, groups []Group) (results []writeResult, failed int, err error) {
 	tx, err := w.db.Begin(ctx)
 	if err != nil {
-		return res, err
+		return nil, -1, err
 	}
 	committed := false
 	defer func() {
@@ -102,7 +170,24 @@ func (w *Writer) writeOnce(ctx context.Context, g Group) (res writeResult, err e
 			_ = tx.Rollback(ctx)
 		}
 	}()
+	results = make([]writeResult, len(groups))
+	for i, g := range groups {
+		res, err := w.writeGroup(ctx, tx, g)
+		if err != nil {
+			return nil, i, err
+		}
+		results[i] = res
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, -1, err
+	}
+	committed = true
+	return results, -1, nil
+}
 
+// writeGroup merges g into its row inside tx: lock or insert the trace row,
+// merge, write it, then insert the event rows (contract 5.3).
+func (w *Writer) writeGroup(ctx context.Context, tx Tx, g Group) (res writeResult, err error) {
 	wsID := WorkspaceID(g.Key.ProjectKey)
 	views := make([]rootView, 0, len(g.Spans))
 	for _, s := range g.Spans {
@@ -194,10 +279,6 @@ func (w *Writer) writeOnce(ctx context.Context, g Group) (res writeResult, err e
 		}
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return res, err
-	}
-	committed = true
 	res.stored = len(added)
 	return res, nil
 }

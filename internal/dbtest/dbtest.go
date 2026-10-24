@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -131,7 +132,7 @@ func (h *Handle) DB() trace.DB { return SQLDB{DB: h.SQL, Postgres: h.Name == "po
 
 // OpenSQLite opens an in-memory SQLite database, with the tables unless
 // noTables is set.
-func OpenSQLite(t *testing.T, noTables bool) *Handle {
+func OpenSQLite(t testing.TB, noTables bool) *Handle {
 	t.Helper()
 	db, err := sql.Open("sqlite", "file:"+randHex()+"?mode=memory&cache=shared")
 	if err != nil {
@@ -147,11 +148,29 @@ func OpenSQLite(t *testing.T, noTables bool) *Handle {
 	return &Handle{Name: "sqlite", SQL: db}
 }
 
+// OpenSQLiteFile opens a SQLite database file in a temp directory, in WAL
+// mode with the given synchronous setting (NORMAL or FULL), with the tables.
+// Benchmarks use it: an in-memory database has no commit cost to measure.
+func OpenSQLiteFile(t testing.TB, synchronous string) *Handle {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "trace.db")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=synchronous("+synchronous+")&_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(sqliteDDL); err != nil {
+		t.Fatalf("sqlite ddl: %v", err)
+	}
+	return &Handle{Name: "sqlite", SQL: db}
+}
+
 // OpenPostgres creates a fresh schema in the database named by
 // COMMUNITY_AGENT_TEST_DSN (skipping when unset) and returns a handle whose
 // connections use that schema. The schema is dropped on cleanup, so tests in
 // different packages never share tables.
-func OpenPostgres(t *testing.T, noTables bool) *Handle {
+func OpenPostgres(t testing.TB, noTables bool) *Handle {
 	t.Helper()
 	base := os.Getenv(DSNEnv)
 	if base == "" {
