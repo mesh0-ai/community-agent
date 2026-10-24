@@ -83,9 +83,15 @@ func (p *Pipeline) Submit(s Span) bool {
 	}
 }
 
+// CloseMargin is how long Close waits for the writer after the grace ran
+// out, for a database call that does not end with its context.
+const CloseMargin = 500 * time.Millisecond
+
 // Close stops intake, flushes every open group and waits for the writer to
 // store them. Writes still pending after grace are abandoned and counted as
-// write_error.
+// write_error. Close returns within about grace + CloseMargin whatever the
+// database does: the grace starts when Close is called, not after the flush,
+// so a flush into a full write queue cannot outlast it.
 func (p *Pipeline) Close(grace time.Duration) {
 	p.mu.Lock()
 	if p.closed {
@@ -98,10 +104,21 @@ func (p *Pipeline) Close(grace time.Duration) {
 	if !p.started {
 		p.Start()
 	}
-	<-p.loopDone
 	t := time.AfterFunc(grace, p.writerAbort)
-	<-p.writerDone
-	t.Stop()
+	defer t.Stop()
+	// Bounded: once the grace runs out, enqueueWrite stops waiting for room.
+	<-p.loopDone
+	select {
+	case <-p.writerDone:
+	case <-p.writerCtx.Done():
+		select {
+		case <-p.writerDone:
+		case <-time.After(CloseMargin):
+			// A database call is ignoring its context. Its group, and the
+			// groups queued behind it, are counted when it returns.
+			p.log.Warn("trace writer still busy after the shutdown grace; leaving it", "grace", grace)
+		}
+	}
 	p.writerAbort()
 }
 
@@ -133,13 +150,18 @@ func (p *Pipeline) loop() {
 
 // enqueueWrite hands a flushed group to the writer. While open, a full
 // queue drops the group; during shutdown it waits, so open groups flushed by
-// Close are not lost to a momentarily full queue.
+// Close are not lost to a momentarily full queue, but only until the grace
+// runs out: then the group is unwritten and counted as write_error.
 func (p *Pipeline) enqueueWrite(g Group) {
 	p.mu.RLock()
 	closing := p.closed
 	p.mu.RUnlock()
 	if closing {
-		p.writeCh <- g
+		select {
+		case p.writeCh <- g:
+		case <-p.writerCtx.Done():
+			p.counters.WriteError.Add(uint64(len(g.Spans)))
+		}
 		return
 	}
 	select {

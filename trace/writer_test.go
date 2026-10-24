@@ -18,13 +18,19 @@ const testTrace = "0123456789abcdef0123456789abcdef"
 // payload of that many bytes.
 func mkSpan(t *testing.T, project, spanID, parent, event string, tsMs int, pad int) trace.Span {
 	t.Helper()
+	return mkSpanTrace(t, project, testTrace, spanID, parent, event, tsMs, pad)
+}
+
+// mkSpanTrace is mkSpan in a given trace.
+func mkSpanTrace(t testing.TB, project, traceID, spanID, parent, event string, tsMs int, pad int) trace.Span {
+	t.Helper()
 	ts := time.Date(2026, 10, 13, 9, 50, 0, 0, time.UTC).Add(time.Duration(tsMs) * time.Millisecond).Format("2006-01-02T15:04:05.000Z")
 	parentField := ""
 	if parent != "" {
 		parentField = `,"parent_span_id":"` + parent + `"`
 	}
 	body := fmt.Sprintf(`{"timestamp":%q,"trace_id":%q,"span_id":%q%s,"attributes":{"event_name":%q,"status":"success","duration_ms":1,"obj_type":"t","obj_name":%q},"data":{"pad":%q}}`,
-		ts, testTrace, spanID, parentField, event, "obj-"+spanID, strings.Repeat("x", pad))
+		ts, traceID, spanID, parentField, event, "obj-"+spanID, strings.Repeat("x", pad))
 	s, err := trace.DecodeSpan(project, []byte(body))
 	if err != nil {
 		t.Fatal(err)
@@ -33,6 +39,9 @@ func mkSpan(t *testing.T, project, spanID, parent, event string, tsMs int, pad i
 }
 
 func sid(i int) string { return fmt.Sprintf("%016x", i) }
+
+// traceN is the i-th test trace id.
+func traceN(i int) string { return fmt.Sprintf("%032x", i+1) }
 
 func syncWriter(t *testing.T, db trace.DB, cfg trace.Config) (*trace.Assembler, *trace.Counters) {
 	c := &trace.Counters{}
