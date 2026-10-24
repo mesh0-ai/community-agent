@@ -69,7 +69,7 @@ socket from binding.
 | `cap_dropped` | Span past the span or byte cap of its merged row (also added to the row's `dropped_spans`) |
 | `duplicate` | Span id already stored for that trace |
 | `write_error` | Data error from the database, or writes still pending when the shutdown grace ran out (per span) |
-| `table_missing` | Failed write attempts against a missing table. The group is retried with backoff, not dropped |
+| `table_missing` | Failed write attempts against a missing table (an attempt can carry several groups). The groups are retried with backoff, not dropped |
 
 ## Embedding the `trace` package (client-go)
 
