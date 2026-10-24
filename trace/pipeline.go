@@ -12,7 +12,8 @@ import (
 //	Submit ──in──▶ assembler loop ──writeCh──▶ writer loop ──▶ DB
 //
 // Submit never blocks. Both queues are bounded and their overflow is counted
-// as queue_full.
+// as queue_full. The writer loop writes whatever groups are queued together,
+// several per transaction (Config.BatchGroups, Config.BatchBytes).
 type Pipeline struct {
 	cfg      Config
 	counters *Counters
@@ -57,6 +58,9 @@ func NewPipeline(db DB, cfg Config, counters *Counters, log *slog.Logger) *Pipel
 // Writer exposes the writer so a caller (or test) can replace its Sleep.
 func (p *Pipeline) Writer() *Writer { return p.writer }
 
+// Config is the pipeline's configuration, with the defaults filled in.
+func (p *Pipeline) Config() Config { return p.cfg }
+
 // Start launches the assembler and writer goroutines.
 func (p *Pipeline) Start() {
 	p.started = true
@@ -83,9 +87,16 @@ func (p *Pipeline) Submit(s Span) bool {
 	}
 }
 
+// CloseMargin is how long Close waits for the writer after the grace ran
+// out, for a database call that does not end with its context.
+const CloseMargin = 500 * time.Millisecond
+
 // Close stops intake, flushes every open group and waits for the writer to
 // store them. Writes still pending after grace are abandoned and counted as
-// write_error.
+// write_error. Close returns within about grace + CloseMargin whatever the
+// database does: the grace starts when Close is called, not after the flush,
+// so a flush into a full write queue cannot outlast it. A grace of 0
+// abandons every write still pending, the groups Close flushes included.
 func (p *Pipeline) Close(grace time.Duration) {
 	p.mu.Lock()
 	if p.closed {
@@ -98,10 +109,21 @@ func (p *Pipeline) Close(grace time.Duration) {
 	if !p.started {
 		p.Start()
 	}
-	<-p.loopDone
 	t := time.AfterFunc(grace, p.writerAbort)
-	<-p.writerDone
-	t.Stop()
+	defer t.Stop()
+	// Bounded: once the grace runs out, enqueueWrite stops waiting for room.
+	<-p.loopDone
+	select {
+	case <-p.writerDone:
+	case <-p.writerCtx.Done():
+		select {
+		case <-p.writerDone:
+		case <-time.After(CloseMargin):
+			// A database call is ignoring its context. Its group, and the
+			// groups queued behind it, are counted when it returns.
+			p.log.Warn("trace writer still busy after the shutdown grace; leaving it", "grace", grace)
+		}
+	}
 	p.writerAbort()
 }
 
@@ -133,13 +155,18 @@ func (p *Pipeline) loop() {
 
 // enqueueWrite hands a flushed group to the writer. While open, a full
 // queue drops the group; during shutdown it waits, so open groups flushed by
-// Close are not lost to a momentarily full queue.
+// Close are not lost to a momentarily full queue, but only until the grace
+// runs out: then the group is unwritten and counted as write_error.
 func (p *Pipeline) enqueueWrite(g Group) {
 	p.mu.RLock()
 	closing := p.closed
 	p.mu.RUnlock()
 	if closing {
-		p.writeCh <- g
+		select {
+		case p.writeCh <- g:
+		case <-p.writerCtx.Done():
+			p.counters.WriteError.Add(uint64(len(g.Spans)))
+		}
 		return
 	}
 	select {
@@ -149,9 +176,52 @@ func (p *Pipeline) enqueueWrite(g Group) {
 	}
 }
 
+// writeLoop writes the queued groups in batches: it waits for one group,
+// then takes whatever else is already queued, up to BatchGroups groups and
+// BatchBytes span bytes, and writes them in one transaction. It never waits
+// for a batch to fill, so a quiet pipeline still writes each group at once.
 func (p *Pipeline) writeLoop() {
 	defer close(p.writerDone)
-	for g := range p.writeCh {
-		_ = p.writer.Write(p.writerCtx, g)
+	var carry *Group
+	for {
+		var first Group
+		if carry != nil {
+			first, carry = *carry, nil
+		} else {
+			g, ok := <-p.writeCh
+			if !ok {
+				return
+			}
+			first = g
+		}
+		batch := []Group{first}
+		size := groupSize(first)
+	collect:
+		for len(batch) < p.cfg.BatchGroups {
+			select {
+			case g, ok := <-p.writeCh:
+				if !ok {
+					break collect
+				}
+				if size+groupSize(g) > p.cfg.BatchBytes {
+					carry = &g
+					break collect
+				}
+				batch = append(batch, g)
+				size += groupSize(g)
+			default:
+				break collect
+			}
+		}
+		_ = p.writer.WriteBatch(p.writerCtx, batch)
 	}
+}
+
+// groupSize is the summed byte size of a group's spans.
+func groupSize(g Group) int64 {
+	var n int64
+	for _, s := range g.Spans {
+		n += s.Size()
+	}
+	return n
 }

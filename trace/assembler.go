@@ -23,6 +23,12 @@ type Config struct {
 	// WriteQueue bounds flushed groups waiting for the writer. A full queue
 	// drops the group's spans and counts them as queue_full.
 	WriteQueue int
+	// BatchGroups bounds the groups the Pipeline's writer stores in one
+	// transaction. 1 writes each group in its own.
+	BatchGroups int
+	// BatchBytes bounds the summed span bytes of one batch. A single group
+	// larger than this is still written, alone.
+	BatchBytes int64
 	// Now is the clock. Nil means time.Now.
 	Now func() time.Time
 }
@@ -35,6 +41,9 @@ const (
 	DefaultMaxGroups  = 10_000
 	DefaultQueueSize  = 2_000
 	DefaultWriteQueue = 256
+	// DefaultBatchGroups and DefaultBatchBytes bound one write transaction.
+	DefaultBatchGroups = 64
+	DefaultBatchBytes  = 4 << 20
 )
 
 // withDefaults fills zero fields.
@@ -56,6 +65,12 @@ func (c Config) withDefaults() Config {
 	}
 	if c.WriteQueue <= 0 {
 		c.WriteQueue = DefaultWriteQueue
+	}
+	if c.BatchGroups <= 0 {
+		c.BatchGroups = DefaultBatchGroups
+	}
+	if c.BatchBytes <= 0 {
+		c.BatchBytes = DefaultBatchBytes
 	}
 	if c.Now == nil {
 		c.Now = time.Now

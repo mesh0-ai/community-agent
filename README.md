@@ -17,8 +17,9 @@ UDS datagram ─▶ listener ─▶ router: strip _project/_token, verify token,
                      flush on root / idle / cap / SIGTERM
                                    │
                                    ▼
-                     trace.Writer: one transaction per group, merge by span id,
-                     caps on the merged row, event rows ON CONFLICT DO NOTHING
+                     trace.Writer: the groups already queued, up to 64 groups /
+                     4 MiB, in one transaction; merge by span id, caps on the
+                     merged row, event rows ON CONFLICT DO NOTHING
 ```
 
 The agent never runs DDL. PHP (x2's DBO pass) owns both tables.
@@ -68,7 +69,7 @@ socket from binding.
 | `cap_dropped` | Span past the span or byte cap of its merged row (also added to the row's `dropped_spans`) |
 | `duplicate` | Span id already stored for that trace |
 | `write_error` | Data error from the database, or writes still pending when the shutdown grace ran out (per span) |
-| `table_missing` | Failed write attempts against a missing table. The group is retried with backoff, not dropped |
+| `table_missing` | Failed write attempts against a missing table (an attempt can carry several groups). The groups are retried with backoff, not dropped |
 
 ## Embedding the `trace` package (client-go)
 
@@ -86,11 +87,26 @@ this with an import allowlist and a `go list -deps` check. To embed it:
    no longer has `_project` / `_token`. Only spans whose token you verified belong here.
 3. Run `p := trace.NewPipeline(db, trace.Config{}, &trace.Counters{}, logger)`,
    `p.Start()`, `p.Submit(span)` (never blocks), and `p.Close(grace)` on shutdown.
-   Zero `Config` fields take the contract defaults.
+   Zero `Config` fields take the contract defaults. `Close` returns within about
+   `grace + trace.CloseMargin` whatever the database does: the grace starts when
+   `Close` is called, and what is still unwritten then counts as `write_error`.
+   A database call that ignores its context is left running; its group and the
+   ones queued behind it are counted when it returns. A grace of 0 abandons
+   every write still pending, the groups `Close` flushes included.
+
+The writer stores every group already waiting in its queue together, in one
+transaction, up to `Config.BatchGroups` groups (64) and `Config.BatchBytes`
+span bytes (4 MiB); `BatchGroups: 1` writes one group per transaction. It
+never waits for a batch to fill. The stored rows are the same either way: each
+group is merged in order, and a later group for the same trace sees the earlier
+one's writes. A data error drops only its own group: the batch is rolled back,
+the groups before it are written again, and the rest carry on. A transient
+error or a missing table retries the whole batch.
 
 To drive it synchronously instead (tests, a single-threaded host), use
 `trace.NewAssembler(cfg, counters, emit)` with `Add` / `FlushIdle` / `FlushAll`
-and `trace.NewWriter(db, cfg, counters, log).Write(ctx, group)` in `emit`.
+and `trace.NewWriter(db, cfg, counters, log).Write(ctx, group)` in `emit`
+(`WriteBatch(ctx, groups)` writes several in one transaction).
 Keep one writer per database: the merge reads, modifies and writes the row in one transaction.
 
 ## Golden fixtures
@@ -121,3 +137,9 @@ COMMUNITY_AGENT_TEST_DSN='postgres://user:pass@localhost:5432/community_agent_te
 
 With the DSN set, each Postgres test creates its own schema in that
 database, creates the two tables there (test setup only), and drops the schema afterwards.
+
+`go test ./trace -run '^$' -bench .` measures the writer: `BenchmarkWriteBatch`
+reports stored traces per second, transactions per trace and in-process CPU per
+trace for 1, 8 and 64 groups per transaction, on a SQLite file (WAL) and, with
+the DSN set, on Postgres. `BenchmarkPipelineOfferedLoad` drives the pipeline at
+a fixed rate and reports the share stored.
