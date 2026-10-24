@@ -180,3 +180,12 @@ func waitFor(t *testing.T, cond func() bool) {
 		time.Sleep(2 * time.Millisecond)
 	}
 }
+
+// TestConfigFillsDefaults: Config reports what the pipeline runs with.
+func TestConfigFillsDefaults(t *testing.T) {
+	p := trace.NewPipeline(newStallDB(false), trace.Config{BatchGroups: 4}, &trace.Counters{}, nil)
+	cfg := p.Config()
+	if cfg.BatchGroups != 4 || cfg.BatchBytes != trace.DefaultBatchBytes || cfg.MaxSpans != trace.DefaultMaxSpans {
+		t.Fatalf("Config() = %+v", cfg)
+	}
+}

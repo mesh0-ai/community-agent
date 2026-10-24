@@ -91,7 +91,8 @@ this with an import allowlist and a `go list -deps` check. To embed it:
    `grace + trace.CloseMargin` whatever the database does: the grace starts when
    `Close` is called, and what is still unwritten then counts as `write_error`.
    A database call that ignores its context is left running; its group and the
-   ones queued behind it are counted when it returns.
+   ones queued behind it are counted when it returns. A grace of 0 abandons
+   every write still pending, the groups `Close` flushes included.
 
 The writer stores every group already waiting in its queue together, in one
 transaction, up to `Config.BatchGroups` groups (64) and `Config.BatchBytes`

@@ -58,6 +58,9 @@ func NewPipeline(db DB, cfg Config, counters *Counters, log *slog.Logger) *Pipel
 // Writer exposes the writer so a caller (or test) can replace its Sleep.
 func (p *Pipeline) Writer() *Writer { return p.writer }
 
+// Config is the pipeline's configuration, with the defaults filled in.
+func (p *Pipeline) Config() Config { return p.cfg }
+
 // Start launches the assembler and writer goroutines.
 func (p *Pipeline) Start() {
 	p.started = true
@@ -92,7 +95,8 @@ const CloseMargin = 500 * time.Millisecond
 // store them. Writes still pending after grace are abandoned and counted as
 // write_error. Close returns within about grace + CloseMargin whatever the
 // database does: the grace starts when Close is called, not after the flush,
-// so a flush into a full write queue cannot outlast it.
+// so a flush into a full write queue cannot outlast it. A grace of 0
+// abandons every write still pending, the groups Close flushes included.
 func (p *Pipeline) Close(grace time.Duration) {
 	p.mu.Lock()
 	if p.closed {

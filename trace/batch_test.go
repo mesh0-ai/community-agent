@@ -3,6 +3,7 @@ package trace_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -392,4 +393,63 @@ func TestPipelineBatchBytes(t *testing.T) {
 	if c.StoredSpans.Load() != 9 {
 		t.Fatalf("stored=%d, want 9", c.StoredSpans.Load())
 	}
+}
+
+// TestBatchRealDriverDataErrorMatchesOneByOne: a span whose data holds a
+// NUL (\u0000), which Postgres jsonb refuses (22P05) while SQLite stores it,
+// in the middle of a batch, with groups of the same key before and after it.
+// The rows must be exactly what writing the groups one by one gives on the
+// same backend. On Postgres the failed statement aborts the transaction, so
+// this is the real rollback path, not an injected error.
+func TestBatchRealDriverDataErrorMatchesOneByOne(t *testing.T) {
+	nul := func(traceID, spanID, parent string) trace.Span {
+		body := fmt.Sprintf(`{"timestamp":"2026-10-13T09:50:00.000Z","trace_id":%q,"span_id":%q,"parent_span_id":%q,"attributes":{"event_name":"function_execute","status":"success"},"data":{"pad":"a\u0000b"}}`, traceID, spanID, parent)
+		s, err := trace.DecodeSpan("workspace-7", []byte(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	a, b := traceN(1), traceN(2)
+	groups := []trace.Group{
+		rootGroup(t, a, mkSpanTrace(t, "workspace-7", a, sid(1), sid(0), "function_execute", 1, 0)),
+		rootGroup(t, a, nul(a, sid(2), sid(0))),
+		rootGroup(t, b, mkSpanTrace(t, "workspace-7", b, sid(0), "", "query_execute", 0, 0)),
+		rootGroup(t, a, mkSpanTrace(t, "workspace-7", a, sid(0), "", "query_execute", 0, 0)),
+	}
+	dbtest.Each(t, false, func(t *testing.T, h *dbtest.Handle) {
+		oracle := dbtest.OpenSQLite(t, false)
+		if h.Name == "postgres" {
+			oracle = dbtest.OpenPostgres(t, false)
+		}
+		one := &trace.Counters{}
+		ow := trace.NewWriter(oracle.DB(), trace.Config{}, one, nil)
+		for _, g := range groups {
+			_ = ow.Write(context.Background(), g)
+		}
+
+		db := &probeDB{inner: h.DB()}
+		c := &trace.Counters{}
+		err := trace.NewWriter(db, trace.Config{}, c, nil).WriteBatch(context.Background(), groups)
+
+		if got, want := dbtest.Canonical(t, dbtest.ReadTraces(t, h.SQL)), dbtest.Canonical(t, dbtest.ReadTraces(t, oracle.SQL)); got != want {
+			t.Fatalf("mvp_trace differs from one by one\n got: %s\nwant: %s", got, want)
+		}
+		if got, want := dbtest.Canonical(t, dbtest.ReadEvents(t, h.SQL)), dbtest.Canonical(t, dbtest.ReadEvents(t, oracle.SQL)); got != want {
+			t.Fatalf("mvp_trace_event differs from one by one\n got: %s\nwant: %s", got, want)
+		}
+		if c.StoredSpans.Load() != one.StoredSpans.Load() || c.WriteError.Load() != one.WriteError.Load() || c.TracesWritten.Load() != one.TracesWritten.Load() {
+			t.Fatalf("counters stored=%d write_error=%d traces_written=%d, one by one %d / %d / %d",
+				c.StoredSpans.Load(), c.WriteError.Load(), c.TracesWritten.Load(), one.StoredSpans.Load(), one.WriteError.Load(), one.TracesWritten.Load())
+		}
+		begins, committed := db.stats()
+		if h.Name == "postgres" {
+			// [a1 a-nul b a0] fails at a-nul -> [a1] alone, then [b a0]
+			if err == nil || c.WriteError.Load() != 1 || begins != 3 || len(committed) != 2 || committed[0] != 1 || committed[1] != 2 {
+				t.Fatalf("err=%v write_error=%d begins=%d committed=%v, want an error, 1, 3, [1 2]", err, c.WriteError.Load(), begins, committed)
+			}
+		} else if err != nil || begins != 1 {
+			t.Fatalf("sqlite stores the NUL: err=%v begins=%d, want nil / 1", err, begins)
+		}
+	})
 }
