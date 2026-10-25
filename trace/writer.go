@@ -154,11 +154,26 @@ func (w *Writer) abandon(groups []Group, cause, last error) error {
 
 type writeResult struct {
 	stored, capDropped, duplicate int
+	// added is the spans the group added to its row, whose event rows the
+	// batch inserts.
+	added []Span
 }
 
 // writeBatchOnce writes groups in one transaction. On error, failed is the
 // index of the group whose statement failed, or -1 when the error is not
-// one group's (Begin, Commit).
+// one group's (Begin, Commit, a multi-row statement).
+//
+// It runs as few statements as the merge allows. With a Querier, the first
+// group of each key in the batch is merged into an empty row and all of
+// them are offered to one multi-row INSERT ... ON CONFLICT DO NOTHING; the
+// keys it returns are stored, whole, with no read. Every other group (a key
+// that already had a row, or a later group for a key earlier in the batch)
+// is merged into its stored row with the upsert and update, in batch order.
+// The event rows of every group are inserted at the end, several per
+// statement. A one-span trace thus costs one row in each of two statements
+// instead of three statements of its own, and the rows are the same as
+// writing the groups one by one: a key is either new, and its merge into an
+// empty row is what the upsert would have read, or it goes the old way.
 func (w *Writer) writeBatchOnce(ctx context.Context, groups []Group) (results []writeResult, failed int, err error) {
 	tx, err := w.db.Begin(ctx)
 	if err != nil {
@@ -171,12 +186,27 @@ func (w *Writer) writeBatchOnce(ctx context.Context, groups []Group) (results []
 		}
 	}()
 	results = make([]writeResult, len(groups))
+	inserted := make([]bool, len(groups))
+	if q, ok := tx.(Querier); ok {
+		if i, err := w.insertNewTraces(ctx, q, groups, inserted, results); err != nil {
+			return nil, i, err
+		}
+	}
+	var events []eventRow
 	for i, g := range groups {
+		if inserted[i] {
+			events = appendEvents(events, g, results[i].added)
+			continue
+		}
 		res, err := w.writeGroup(ctx, tx, g)
 		if err != nil {
 			return nil, i, err
 		}
 		results[i] = res
+		events = appendEvents(events, g, res.added)
+	}
+	if err := insertEvents(ctx, tx, events); err != nil {
+		return nil, -1, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, -1, err
@@ -185,8 +215,170 @@ func (w *Writer) writeBatchOnce(ctx context.Context, groups []Group) (results []
 	return results, -1, nil
 }
 
+// merged is a group merged into a stored row: the row to write and the
+// spans the group added to it.
+type merged struct {
+	root                  rootView
+	count, bytes, dropped int64
+	spans                 string
+	added                 []Span
+	stored, capped, dupes int
+}
+
+// merge merges g into a stored row holding existing (its spans, in stored
+// order), byteCount and dropped: duplicates by span id are skipped, the caps
+// apply to the merged row, and the root columns come from the merged set
+// (contract 5.1). A new row is merge(nil, 0, 0, g).
+func (w *Writer) merge(existing []json.RawMessage, byteCount, dropped int64, g Group) (merged, error) {
+	var m merged
+	seen := make(map[string]bool, len(existing)+len(g.Spans))
+	views := make([]rootView, 0, len(existing)+len(g.Spans))
+	for _, raw := range existing {
+		var ss storedSpan
+		if err := json.Unmarshal(raw, &ss); err != nil {
+			return m, fmt.Errorf("%w: a stored span is not an object: %v", errCorruptRow, err)
+		}
+		seen[ss.SpanID] = true
+		views = append(views, ss.view())
+	}
+
+	count := int64(len(existing))
+	for _, s := range g.Spans {
+		if seen[s.SpanID] {
+			m.dupes++
+			continue
+		}
+		if count >= int64(w.cfg.MaxSpans) || byteCount+s.Size() > w.cfg.MaxBytes {
+			m.capped++
+			continue
+		}
+		seen[s.SpanID] = true
+		m.added = append(m.added, s)
+		views = append(views, s.view())
+		count++
+		byteCount += s.Size()
+	}
+
+	var out bytes.Buffer
+	out.WriteByte('[')
+	for i, raw := range existing {
+		if i > 0 {
+			out.WriteByte(',')
+		}
+		out.Write(raw)
+	}
+	for i, s := range m.added {
+		if i > 0 || len(existing) > 0 {
+			out.WriteByte(',')
+		}
+		out.Write(s.Encoded)
+	}
+	out.WriteByte(']')
+
+	m.root, _ = pickRoot(views)
+	m.count, m.bytes, m.dropped = count, byteCount, dropped+int64(m.capped)
+	m.spans = out.String()
+	m.stored = len(m.added)
+	return m, nil
+}
+
+// insertNewTraces offers the first group of each key in groups to
+// sqlInsertNewTraces, each merged into an empty row, and marks inserted[i]
+// (with results[i]) for every group whose key the INSERT returned. An error
+// is no single group's (-1): WriteBatch then writes each group on its own,
+// where a failing group is the batch's only one.
+func (w *Writer) insertNewTraces(ctx context.Context, q Querier, groups []Group, inserted []bool, results []writeResult) (int, error) {
+	first := make(map[Key]int, len(groups))
+	var idx []int
+	for i, g := range groups {
+		if _, ok := first[g.Key]; ok {
+			continue
+		}
+		first[g.Key] = i
+		idx = append(idx, i)
+	}
+	rows := make(map[int]merged, len(idx))
+	for start := 0; start < len(idx); start += maxRowsPerStatement {
+		chunk := idx[start:min(start+maxRowsPerStatement, len(idx))]
+		args := make([]any, 0, len(chunk)*traceInsertCols)
+		for _, i := range chunk {
+			g := groups[i]
+			m, err := w.merge(nil, 0, 0, g) // no stored spans to read: cannot fail
+			if err != nil {
+				return -1, err
+			}
+			rows[i] = m
+			a := m.root.attrs
+			args = append(args, g.Key.ProjectKey, g.Key.TraceID, WorkspaceID(g.Key.ProjectKey),
+				a.EventName, a.ObjType, a.ObjName, a.Status, a.ErrorType, m.root.tsMs, a.DurationMs,
+				m.count, m.bytes, m.dropped, m.spans)
+		}
+		got, err := q.Query(ctx, sqlInsertNewTraces(len(chunk)), args...)
+		if err == nil {
+			err = func() error {
+				defer got.Close()
+				for got.Next() {
+					var k Key
+					if err := got.Scan(&k.ProjectKey, &k.TraceID); err != nil {
+						return err
+					}
+					i, ok := first[k]
+					if !ok {
+						return fmt.Errorf("trace: the insert returned a key it was not given (%s, %s)", k.ProjectKey, k.TraceID)
+					}
+					m := rows[i]
+					inserted[i] = true
+					results[i] = writeResult{stored: m.stored, capDropped: m.capped, duplicate: m.dupes, added: m.added}
+				}
+				return got.Err()
+			}()
+		}
+		if err != nil {
+			return -1, err
+		}
+	}
+	return -1, nil
+}
+
+// eventRow is one mvp_trace_event row to insert: a span and its key.
+type eventRow struct {
+	key  Key
+	span Span
+}
+
+// appendEvents adds the event rows of the spans g added to its row: one per
+// span that wants one (contract 5.2).
+func appendEvents(events []eventRow, g Group, added []Span) []eventRow {
+	for _, s := range added {
+		if s.WantsEventRow() {
+			events = append(events, eventRow{key: g.Key, span: s})
+		}
+	}
+	return events
+}
+
+// insertEvents inserts events, up to maxRowsPerStatement rows per statement.
+// An error is no single group's, as in insertNewTraces.
+func insertEvents(ctx context.Context, tx Tx, events []eventRow) error {
+	for start := 0; start < len(events); start += maxRowsPerStatement {
+		chunk := events[start:min(start+maxRowsPerStatement, len(events))]
+		args := make([]any, 0, len(chunk)*eventInsertCols)
+		for _, e := range chunk {
+			a := e.span.Attrs
+			args = append(args, e.key.ProjectKey, e.key.TraceID, e.span.SpanID, WorkspaceID(e.key.ProjectKey),
+				a.EventName, a.ObjType, a.ObjName, a.Status, a.ErrorType,
+				a.DurationMs, a.AggregateCount(), e.span.TsMs)
+		}
+		if err := tx.Exec(ctx, sqlInsertEvents(len(chunk)), args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // writeGroup merges g into its row inside tx: lock or insert the trace row,
-// merge, write it, then insert the event rows (contract 5.3).
+// merge, then write it (contract 5.3). Its event rows are inserted by the
+// caller, with the batch's.
 func (w *Writer) writeGroup(ctx context.Context, tx Tx, g Group) (res writeResult, err error) {
 	wsID := WorkspaceID(g.Key.ProjectKey)
 	views := make([]rootView, 0, len(g.Spans))
@@ -211,74 +403,17 @@ func (w *Writer) writeGroup(ctx context.Context, tx Tx, g Group) (res writeResul
 	if err := json.Unmarshal([]byte(spansJSON), &existing); err != nil {
 		return res, fmt.Errorf("%w: spans is not a JSON array: %v", errCorruptRow, err)
 	}
-	seen := make(map[string]bool, len(existing)+len(g.Spans))
-	merged := make([]rootView, 0, len(existing)+len(g.Spans))
-	for _, raw := range existing {
-		var ss storedSpan
-		if err := json.Unmarshal(raw, &ss); err != nil {
-			return res, fmt.Errorf("%w: a stored span is not an object: %v", errCorruptRow, err)
-		}
-		seen[ss.SpanID] = true
-		merged = append(merged, ss.view())
+	m, err := w.merge(existing, byteCount, dropped, g)
+	if err != nil {
+		return res, err
 	}
-
-	count := int64(len(existing))
-	var added []Span
-	for _, s := range g.Spans {
-		if seen[s.SpanID] {
-			res.duplicate++
-			continue
-		}
-		if count >= int64(w.cfg.MaxSpans) || byteCount+s.Size() > w.cfg.MaxBytes {
-			res.capDropped++
-			continue
-		}
-		seen[s.SpanID] = true
-		added = append(added, s)
-		merged = append(merged, s.view())
-		count++
-		byteCount += s.Size()
-	}
-	dropped += int64(res.capDropped)
-
-	var out bytes.Buffer
-	out.WriteByte('[')
-	for i, raw := range existing {
-		if i > 0 {
-			out.WriteByte(',')
-		}
-		out.Write(raw)
-	}
-	for i, s := range added {
-		if i > 0 || len(existing) > 0 {
-			out.WriteByte(',')
-		}
-		out.Write(s.Encoded)
-	}
-	out.WriteByte(']')
-
-	root, _ := pickRoot(merged)
+	a := m.root.attrs
 	if err := tx.Exec(ctx, sqlUpdateTrace,
-		wsID, root.attrs.EventName, root.attrs.ObjType, root.attrs.ObjName,
-		root.attrs.Status, root.attrs.ErrorType, root.tsMs, root.attrs.DurationMs,
-		count, byteCount, dropped, out.String(),
+		wsID, a.EventName, a.ObjType, a.ObjName,
+		a.Status, a.ErrorType, m.root.tsMs, a.DurationMs,
+		m.count, m.bytes, m.dropped, m.spans,
 		g.Key.ProjectKey, g.Key.TraceID); err != nil {
 		return res, err
 	}
-
-	for _, s := range added {
-		if !s.WantsEventRow() {
-			continue
-		}
-		a := s.Attrs
-		if err := tx.Exec(ctx, sqlInsertEvent,
-			g.Key.ProjectKey, g.Key.TraceID, s.SpanID, wsID,
-			a.EventName, a.ObjType, a.ObjName, a.Status, a.ErrorType,
-			a.DurationMs, a.AggregateCount(), s.TsMs); err != nil {
-			return res, err
-		}
-	}
-
-	res.stored = len(added)
-	return res, nil
+	return writeResult{stored: m.stored, capDropped: m.capped, duplicate: m.dupes, added: m.added}, nil
 }

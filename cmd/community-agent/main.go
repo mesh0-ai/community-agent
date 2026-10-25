@@ -323,8 +323,15 @@ func classifyPgError(err error) trace.ErrorKind {
 
 type pgxTx struct{ tx pgx.Tx }
 
+// pgxTx has Query, so the writer stores a batch's new traces in one INSERT.
+var _ trace.Querier = pgxTx{}
+
 func (t pgxTx) QueryRow(ctx context.Context, q string, args ...any) trace.Row {
 	return t.tx.QueryRow(ctx, q, args...)
+}
+
+func (t pgxTx) Query(ctx context.Context, q string, args ...any) (trace.Rows, error) {
+	return t.tx.Query(ctx, q, args...)
 }
 
 func (t pgxTx) Exec(ctx context.Context, q string, args ...any) error {
