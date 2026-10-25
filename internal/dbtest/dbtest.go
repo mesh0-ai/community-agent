@@ -262,6 +262,8 @@ func (d SQLDB) Classify(err error) trace.ErrorKind {
 
 type sqlTx struct{ tx *sql.Tx }
 
+var _ trace.Querier = sqlTx{}
+
 func (t sqlTx) QueryRow(ctx context.Context, q string, args ...any) trace.Row {
 	return t.tx.QueryRowContext(ctx, q, args...)
 }
@@ -269,8 +271,20 @@ func (t sqlTx) Exec(ctx context.Context, q string, args ...any) error {
 	_, err := t.tx.ExecContext(ctx, q, args...)
 	return err
 }
+func (t sqlTx) Query(ctx context.Context, q string, args ...any) (trace.Rows, error) {
+	rows, err := t.tx.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	return sqlRows{rows}, nil
+}
 func (t sqlTx) Commit(context.Context) error   { return t.tx.Commit() }
 func (t sqlTx) Rollback(context.Context) error { return t.tx.Rollback() }
+
+// sqlRows is *sql.Rows as trace.Rows (whose Close returns nothing).
+type sqlRows struct{ *sql.Rows }
+
+func (r sqlRows) Close() { _ = r.Rows.Close() }
 
 // TraceRow is an mvp_trace row with the volatile columns (id, created_at,
 // updated_at, and event_id inside each span) left out. Field names match the

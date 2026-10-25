@@ -15,17 +15,24 @@ import (
 )
 
 // probeDB wraps a trace.DB to watch and break transactions: it records how
-// many groups each committed transaction wrote, fails the trace UPDATE of
-// any trace id in badUpdate (a data error at that group), fails the commit
-// of a transaction that touched a trace id in badCommit (a data error no
-// statement owns), and holds Begin while gate is set.
+// many groups each committed transaction wrote and how many statements each
+// ran, fails the write of any trace id in badWrite (its UPDATE, or a
+// new-trace INSERT holding its row: a data error at that group) and the
+// UPDATE of any trace id in badUpdate (a key that already has a row), fails the
+// commit of a transaction that touched a trace id in badCommit (a data error
+// no statement owns), and holds Begin while gate is set. Its Tx forwards
+// Query when the inner one has it, so the writer takes the same path as on
+// the inner database.
 type probeDB struct {
 	inner trace.DB
 
 	mu        sync.Mutex
 	begins    int
 	committed []int // groups per committed transaction
+	stmts     []int // statements per committed transaction, Begin and Commit not counted
+	badWrite  map[string]bool
 	badUpdate map[string]bool
+	badEvent  map[string]bool // fails an event INSERT holding a row of this trace id
 	badCommit map[string]bool
 	gate      chan struct{}
 }
@@ -70,27 +77,90 @@ func (p *probeDB) stats() (begins int, committed []int) {
 	return p.begins, append([]int(nil), p.committed...)
 }
 
+// statements is the statements each committed transaction ran.
+func (p *probeDB) statements() []int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]int(nil), p.stmts...)
+}
+
 type probeTx struct {
 	inner   trace.Tx
 	db      *probeDB
-	groups  int
+	groups  int // groups written: rows a new-trace INSERT returned, plus upserts
+	stmts   int
 	touched []string
 }
 
-func isTraceUpsert(q string) bool {
+func isTraceInsert(q string) bool {
 	return strings.HasPrefix(q, "INSERT INTO mvp_trace") && !strings.HasPrefix(q, "INSERT INTO mvp_trace_event")
 }
 
 func (t *probeTx) QueryRow(ctx context.Context, q string, args ...any) trace.Row {
-	if isTraceUpsert(q) {
+	t.stmts++
+	if isTraceInsert(q) {
 		t.groups++
 		t.touched = append(t.touched, args[1].(string))
 	}
 	return t.inner.QueryRow(ctx, q, args...)
 }
 
+// newTraceCols and eventCols are the placeholders per row of the writer's
+// new-trace and event INSERTs.
+const (
+	newTraceCols = 14
+	eventCols    = 12
+)
+
+func (t *probeTx) Query(ctx context.Context, q string, args ...any) (trace.Rows, error) {
+	qr, ok := t.inner.(trace.Querier)
+	if !ok {
+		return nil, errors.New("probe: the inner Tx has no Query")
+	}
+	t.stmts++
+	if isTraceInsert(q) {
+		bad := false
+		for i := 1; i < len(args); i += newTraceCols {
+			id := args[i].(string)
+			t.touched = append(t.touched, id)
+			bad = bad || t.db.badWrite[id]
+		}
+		if bad {
+			return nil, errBadValue
+		}
+	}
+	rows, err := qr.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	return &countedRows{Rows: rows, n: &t.groups}, nil
+}
+
+// countedRows counts the rows a new-trace INSERT returned: each is a group
+// stored without an upsert.
+type countedRows struct {
+	trace.Rows
+	n *int
+}
+
+func (r *countedRows) Next() bool {
+	ok := r.Rows.Next()
+	if ok {
+		*r.n++
+	}
+	return ok
+}
+
 func (t *probeTx) Exec(ctx context.Context, q string, args ...any) error {
-	if strings.HasPrefix(q, "UPDATE mvp_trace") && t.db.badUpdate[args[13].(string)] {
+	t.stmts++
+	if strings.HasPrefix(q, "INSERT INTO mvp_trace_event") {
+		for i := 1; i < len(args); i += eventCols {
+			if t.db.badEvent[args[i].(string)] {
+				return errBadValue
+			}
+		}
+	}
+	if strings.HasPrefix(q, "UPDATE mvp_trace") && (t.db.badWrite[args[13].(string)] || t.db.badUpdate[args[13].(string)]) {
 		return errBadValue
 	}
 	return t.inner.Exec(ctx, q, args...)
@@ -107,6 +177,7 @@ func (t *probeTx) Commit(ctx context.Context) error {
 	}
 	t.db.mu.Lock()
 	t.db.committed = append(t.db.committed, t.groups)
+	t.db.stmts = append(t.db.stmts, t.stmts)
 	t.db.mu.Unlock()
 	return nil
 }
@@ -161,45 +232,85 @@ func rootGroup(_ *testing.T, traceID string, spans ...trace.Span) trace.Group {
 // bad ones are dropped and counted, every good one is stored once, a good
 // group after a bad one for the same key still merges, and each good group
 // is written at most twice (once in the failed attempt, once for real).
+//
+// With new keys the bad rows sit in the batch's one new-trace INSERT, which
+// no single group owns, so the batch is retried on the per-group path, which
+// pins the error on its group. With keys that already have a row every group
+// is merged with its own UPDATE, and the error is pinned at once.
 func TestBatchDataErrorDropsOnlyThatGroup(t *testing.T) {
-	dbtest.Each(t, false, func(t *testing.T, h *dbtest.Handle) {
-		good1, bad1, good2, bad2 := traceN(1), traceN(2), traceN(3), traceN(4)
-		db := &probeDB{inner: h.DB(), badUpdate: map[string]bool{bad1: true, bad2: true}}
-		c := &trace.Counters{}
-		groups := []trace.Group{
-			rootGroup(t, good1, mkSpanTrace(t, "workspace-7", good1, sid(1), sid(0), "function_execute", 1, 0)),
-			rootGroup(t, bad1, mkSpanTrace(t, "workspace-7", bad1, sid(0), "", "query_execute", 0, 0),
-				mkSpanTrace(t, "workspace-7", bad1, sid(1), sid(0), "function_execute", 1, 0)),
-			rootGroup(t, good2, mkSpanTrace(t, "workspace-7", good2, sid(0), "", "query_execute", 0, 0)),
-			rootGroup(t, bad2, mkSpanTrace(t, "workspace-7", bad2, sid(0), "", "query_execute", 0, 0)),
-			// the root of good1 arrives in a later group of the same batch
-			rootGroup(t, good1, mkSpanTrace(t, "workspace-7", good1, sid(0), "", "query_execute", 0, 0)),
-		}
-		err := trace.NewWriter(db, trace.Config{}, c, nil).WriteBatch(context.Background(), groups)
-		if !errors.Is(err, errBadValue) {
-			t.Fatalf("err = %v, want the dropped groups' data error", err)
-		}
-		rows := dbtest.ReadTraces(t, h.SQL)
-		if len(rows) != 2 || rows[0].TraceID != good1 || rows[1].TraceID != good2 {
-			t.Fatalf("stored traces %+v, want only %s and %s", rows, good1, good2)
-		}
-		if rows[0].SpanCount != 2 || rows[0].EventName != "query_execute" {
-			t.Fatalf("good1 did not merge its late root: %+v", rows[0])
-		}
-		if ev := dbtest.ReadEvents(t, h.SQL); len(ev) != 3 {
-			t.Fatalf("event rows = %d, want 3 (none for a dropped group)", len(ev))
-		}
-		if c.WriteError.Load() != 3 || c.StoredSpans.Load() != 3 || c.TracesWritten.Load() != 3 {
-			t.Fatalf("write_error=%d stored=%d traces_written=%d, want 3 / 3 / 3",
-				c.WriteError.Load(), c.StoredSpans.Load(), c.TracesWritten.Load())
-		}
-		// attempt [g1 b1 g2 b2 g1'] fails at b1 -> [g1] committed;
-		// attempt [g2 b2 g1'] fails at b2 -> [g2] committed; [g1'] committed.
-		begins, committed := db.stats()
-		if begins != 5 || len(committed) != 3 {
-			t.Fatalf("begins=%d committed=%v, want 5 begins and 3 commits", begins, committed)
-		}
-	})
+	for _, existing := range []bool{false, true} {
+		t.Run(map[bool]string{false: "new keys", true: "existing keys"}[existing], func(t *testing.T) {
+			dbtest.Each(t, false, func(t *testing.T, h *dbtest.Handle) {
+				good1, bad1, good2, bad2 := traceN(1), traceN(2), traceN(3), traceN(4)
+				seeded := int64(0)
+				if existing {
+					// a statement span per key: a stored row, and no event row
+					seed := trace.NewWriter(h.DB(), trace.Config{}, &trace.Counters{}, nil)
+					for _, id := range []string{good1, bad1, good2, bad2} {
+						if err := seed.Write(context.Background(), rootGroup(t, id, mkSpanTrace(t, "workspace-7", id, sid(9), sid(0), "statement_execute", 9, 0))); err != nil {
+							t.Fatal(err)
+						}
+					}
+					seeded = 1
+				}
+				db := &probeDB{inner: h.DB(), badWrite: map[string]bool{bad1: true, bad2: true}}
+				if existing {
+					// the keys have rows, so the bad groups fail at their own UPDATE
+					db = &probeDB{inner: h.DB(), badUpdate: map[string]bool{bad1: true, bad2: true}}
+				}
+				c := &trace.Counters{}
+				groups := []trace.Group{
+					rootGroup(t, good1, mkSpanTrace(t, "workspace-7", good1, sid(1), sid(0), "function_execute", 1, 0)),
+					rootGroup(t, bad1, mkSpanTrace(t, "workspace-7", bad1, sid(0), "", "query_execute", 0, 0),
+						mkSpanTrace(t, "workspace-7", bad1, sid(1), sid(0), "function_execute", 1, 0)),
+					rootGroup(t, good2, mkSpanTrace(t, "workspace-7", good2, sid(0), "", "query_execute", 0, 0)),
+					rootGroup(t, bad2, mkSpanTrace(t, "workspace-7", bad2, sid(0), "", "query_execute", 0, 0)),
+					// the root of good1 arrives in a later group of the same batch
+					rootGroup(t, good1, mkSpanTrace(t, "workspace-7", good1, sid(0), "", "query_execute", 0, 0)),
+				}
+				err := trace.NewWriter(db, trace.Config{}, c, nil).WriteBatch(context.Background(), groups)
+				if !errors.Is(err, errBadValue) {
+					t.Fatalf("err = %v, want the dropped groups' data error", err)
+				}
+				byID := map[string]dbtest.TraceRow{}
+				for _, r := range dbtest.ReadTraces(t, h.SQL) {
+					byID[r.TraceID] = r
+				}
+				if !existing && len(byID) != 2 {
+					t.Fatalf("stored traces %+v, want only %s and %s", byID, good1, good2)
+				}
+				if r := byID[good1]; r.SpanCount != 2+seeded || r.EventName != "query_execute" {
+					t.Fatalf("good1 did not merge its late root: %+v", r)
+				}
+				if r := byID[good2]; r.SpanCount != 1+seeded {
+					t.Fatalf("good2 not stored: %+v", r)
+				}
+				if existing && (byID[bad1].SpanCount != 1 || byID[bad2].SpanCount != 1) {
+					t.Fatalf("a dropped group changed its stored row: %+v / %+v", byID[bad1], byID[bad2])
+				}
+				if ev := dbtest.ReadEvents(t, h.SQL); len(ev) != 3 {
+					t.Fatalf("event rows = %d, want 3 (none for a dropped group)", len(ev))
+				}
+				if c.WriteError.Load() != 3 || c.StoredSpans.Load() != 3 || c.TracesWritten.Load() != 3 {
+					t.Fatalf("write_error=%d stored=%d traces_written=%d, want 3 / 3 / 3",
+						c.WriteError.Load(), c.StoredSpans.Load(), c.TracesWritten.Load())
+				}
+				begins, committed := db.stats()
+				if existing {
+					// attempt [g1 b1 g2 b2 g1'] fails at b1 -> [g1] committed;
+					// attempt [g2 b2 g1'] fails at b2 -> [g2] committed; [g1'] committed.
+					if begins != 5 || len(committed) != 3 {
+						t.Fatalf("begins=%d committed=%v, want 5 begins and 3 commits", begins, committed)
+					}
+				} else if begins != 7 || len(committed) != 3 {
+					// attempt [g1 b1 g2 b2 g1'] fails in the new-trace INSERT -> again per group,
+					// fails at b1 -> [g1] committed; [g2 b2 g1'] fails in the INSERT -> per group,
+					// fails at b2 -> [g2] committed; [g1'] committed.
+					t.Fatalf("begins=%d committed=%v, want 7 begins and 3 commits", begins, committed)
+				}
+			})
+		})
+	}
 }
 
 // TestBatchCommitErrorFallsBackToOneByOne: a commit fails with a data error,
@@ -450,6 +561,129 @@ func TestBatchRealDriverDataErrorMatchesOneByOne(t *testing.T) {
 			}
 		} else if err != nil || begins != 1 {
 			t.Fatalf("sqlite stores the NUL: err=%v begins=%d, want nil / 1", err, begins)
+		}
+	})
+}
+
+// TestBatchRealDriverDataErrorInNewTraces: the NUL span of
+// TestBatchRealDriverDataErrorMatchesOneByOne in a NEW key's group, so it
+// sits in the batch's multi-row new-trace INSERT beside two good new keys.
+// On Postgres that statement fails (22P05) and aborts the transaction, no
+// single group owns it, and each group is then written on its own: the good
+// ones stored, the bad one dropped. SQLite stores it. Either way the rows are
+// what writing the groups one by one gives.
+func TestBatchRealDriverDataErrorInNewTraces(t *testing.T) {
+	a, bad, b := traceN(1), traceN(2), traceN(3)
+	body := fmt.Sprintf(`{"timestamp":"2026-10-13T09:50:00.000Z","trace_id":%q,"span_id":%q,"attributes":{"event_name":"query_execute","status":"success"},"data":{"pad":"a\u0000b"}}`, bad, sid(0))
+	nul, err := trace.DecodeSpan("workspace-7", []byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups := []trace.Group{
+		rootGroup(t, a, mkSpanTrace(t, "workspace-7", a, sid(0), "", "query_execute", 0, 0)),
+		rootGroup(t, bad, nul),
+		rootGroup(t, b, mkSpanTrace(t, "workspace-7", b, sid(0), "", "query_execute", 0, 0)),
+	}
+	dbtest.Each(t, false, func(t *testing.T, h *dbtest.Handle) {
+		oracle := dbtest.OpenSQLite(t, false)
+		if h.Name == "postgres" {
+			oracle = dbtest.OpenPostgres(t, false)
+		}
+		ow := trace.NewWriter(oracle.DB(), trace.Config{}, &trace.Counters{}, nil)
+		for _, g := range groups {
+			_ = ow.Write(context.Background(), g)
+		}
+		db := &probeDB{inner: h.DB()}
+		c := &trace.Counters{}
+		err := trace.NewWriter(db, trace.Config{}, c, nil).WriteBatch(context.Background(), groups)
+		if got, want := dbtest.Canonical(t, dbtest.ReadTraces(t, h.SQL)), dbtest.Canonical(t, dbtest.ReadTraces(t, oracle.SQL)); got != want {
+			t.Fatalf("mvp_trace differs from one by one\n got: %s\nwant: %s", got, want)
+		}
+		if got, want := dbtest.Canonical(t, dbtest.ReadEvents(t, h.SQL)), dbtest.Canonical(t, dbtest.ReadEvents(t, oracle.SQL)); got != want {
+			t.Fatalf("mvp_trace_event differs from one by one\n got: %s\nwant: %s", got, want)
+		}
+		begins, committed := db.stats()
+		if h.Name == "postgres" {
+			// [a bad b] fails in the new-trace INSERT -> [a] [bad fails] [b]
+			if err == nil || c.WriteError.Load() != 1 || c.TracesWritten.Load() != 2 || begins != 4 || len(committed) != 2 {
+				t.Fatalf("err=%v write_error=%d traces_written=%d begins=%d committed=%v, want an error, 1, 2, 4, two commits",
+					err, c.WriteError.Load(), c.TracesWritten.Load(), begins, committed)
+			}
+		} else if err != nil || begins != 1 || c.TracesWritten.Load() != 3 {
+			t.Fatalf("sqlite stores the NUL: err=%v begins=%d traces_written=%d, want nil / 1 / 3", err, begins, c.TracesWritten.Load())
+		}
+	})
+}
+
+// TestOneBadNewTraceCostsTheBatchOneRetry: one bad group among 64 new ones
+// fails the batch's multi-row INSERT. The batch is retried once on the
+// per-group path, which pins the bad group; the groups before it and after
+// it are then written in one transaction each. Four transactions, not one
+// per group.
+func TestOneBadNewTraceCostsTheBatchOneRetry(t *testing.T) {
+	dbtest.Each(t, false, func(t *testing.T, h *dbtest.Handle) {
+		var groups []trace.Group
+		for i := 0; i < 64; i++ {
+			groups = append(groups, rootGroup(t, traceN(i), mkSpanTrace(t, "workspace-7", traceN(i), sid(0), "", "query_execute", 0, 0)))
+		}
+		db := &probeDB{inner: h.DB(), badWrite: map[string]bool{traceN(30): true}}
+		c := &trace.Counters{}
+		if err := trace.NewWriter(db, trace.Config{}, c, nil).WriteBatch(context.Background(), groups); !errors.Is(err, errBadValue) {
+			t.Fatalf("err = %v", err)
+		}
+		// [0..63] fails in the INSERT; per group, fails at 30; [0..29]; [31..63]
+		begins, committed := db.stats()
+		if begins != 4 || len(committed) != 2 || committed[0] != 30 || committed[1] != 33 {
+			t.Fatalf("begins=%d committed=%v, want 4 begins and [30 33]", begins, committed)
+		}
+		if c.TracesWritten.Load() != 63 || c.WriteError.Load() != 1 || len(dbtest.ReadTraces(t, h.SQL)) != 63 {
+			t.Fatalf("traces_written=%d write_error=%d, want 63 / 1", c.TracesWritten.Load(), c.WriteError.Load())
+		}
+	})
+}
+
+// TestManyBadNewTracesStayPerGroup: when every group of a batch is bad, the
+// batch leaves the multi-row path after its second failure there, so it
+// costs about one transaction per group, not a multi-row attempt per group.
+func TestManyBadNewTracesStayPerGroup(t *testing.T) {
+	db := &probeDB{inner: dbtest.OpenSQLite(t, false).DB(), badWrite: map[string]bool{}}
+	var groups []trace.Group
+	for i := 0; i < 64; i++ {
+		db.badWrite[traceN(i)] = true
+		groups = append(groups, rootGroup(t, traceN(i), mkSpanTrace(t, "workspace-7", traceN(i), sid(0), "", "query_execute", 0, 0)))
+	}
+	c := &trace.Counters{}
+	if err := trace.NewWriter(db, trace.Config{}, c, nil).WriteBatch(context.Background(), groups); !errors.Is(err, errBadValue) {
+		t.Fatalf("err = %v", err)
+	}
+	// multi fails, per group drops 0; multi fails again, per group drops 1;
+	// then per group drops each of the other 62: 2 + 2 + 62
+	if begins, committed := db.stats(); begins != 66 || len(committed) != 0 || c.WriteError.Load() != 64 {
+		t.Fatalf("begins=%d committed=%v write_error=%d, want 66 / none / 64", begins, committed, c.WriteError.Load())
+	}
+}
+
+// TestBadEventRowIsPinnedOnItsGroup: a group whose event row fails (its
+// trace row would be stored) among 64 new ones. The batch's multi-row event
+// INSERT fails, the per-group retry inserts each group's event rows with the
+// group and pins the error there, and the batch never retries forever.
+func TestBadEventRowIsPinnedOnItsGroup(t *testing.T) {
+	dbtest.Each(t, false, func(t *testing.T, h *dbtest.Handle) {
+		var groups []trace.Group
+		for i := 0; i < 64; i++ {
+			groups = append(groups, rootGroup(t, traceN(i), mkSpanTrace(t, "workspace-7", traceN(i), sid(0), "", "query_execute", 0, 0)))
+		}
+		db := &probeDB{inner: h.DB(), badEvent: map[string]bool{traceN(30): true}}
+		c := &trace.Counters{}
+		if err := trace.NewWriter(db, trace.Config{}, c, nil).WriteBatch(context.Background(), groups); !errors.Is(err, errBadValue) {
+			t.Fatalf("err = %v", err)
+		}
+		begins, committed := db.stats()
+		if begins != 4 || len(committed) != 2 || c.TracesWritten.Load() != 63 || c.WriteError.Load() != 1 {
+			t.Fatalf("begins=%d committed=%v traces_written=%d write_error=%d, want 4 / two / 63 / 1", begins, committed, c.TracesWritten.Load(), c.WriteError.Load())
+		}
+		if rows, ev := dbtest.ReadTraces(t, h.SQL), dbtest.ReadEvents(t, h.SQL); len(rows) != 63 || len(ev) != 63 {
+			t.Fatalf("rows=%d events=%d, want 63 each", len(rows), len(ev))
 		}
 	})
 }

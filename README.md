@@ -82,6 +82,11 @@ this with an import allowlist and a `go list -deps` check. To embed it:
    into `ErrData`, `ErrTransient` or `ErrTableMissing`. The statements use
    `$1..$n` placeholders (each once, in order), `INSERT … ON CONFLICT`,
    `RETURNING` and `CURRENT_TIMESTAMP`, so they run on Postgres and on SQLite ≥ 3.35.
+   Give the `Tx` a `Query` method too (`trace.Querier`, returning `trace.Rows`,
+   which `pgx.Rows` already is): the writer then stores a batch's new traces in one
+   multi-row `INSERT … ON CONFLICT DO NOTHING RETURNING` and their event rows in
+   another, two statements per batch instead of three per trace. Without it each
+   group is upserted and updated on its own; the rows are the same.
    `internal/dbtest` has a `database/sql` adapter that is used for both in tests.
 2. Build spans with `trace.DecodeSpan(projectKey, spanJSON)`, where the JSON
    no longer has `_project` / `_token`. Only spans whose token you verified belong here.
@@ -100,8 +105,11 @@ span bytes (4 MiB); `BatchGroups: 1` writes one group per transaction. It
 never waits for a batch to fill. The stored rows are the same either way: each
 group is merged in order, and a later group for the same trace sees the earlier
 one's writes. A data error drops only its own group: the batch is rolled back,
-the groups before it are written again, and the rest carry on. A transient
-error or a missing table retries the whole batch.
+the groups before it are written again, and the rest carry on (an error in a
+multi-row statement, which no single group owns, retries the batch with one
+upsert and update per group, which pins it; after a second such error the
+rest of the batch stays per group). A transient error or a
+missing table retries the whole batch.
 
 To drive it synchronously instead (tests, a single-threaded host), use
 `trace.NewAssembler(cfg, counters, emit)` with `Add` / `FlushIdle` / `FlushAll`
