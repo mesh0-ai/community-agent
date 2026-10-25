@@ -32,6 +32,7 @@ type probeDB struct {
 	stmts     []int // statements per committed transaction, Begin and Commit not counted
 	badWrite  map[string]bool
 	badUpdate map[string]bool
+	badEvent  map[string]bool // fails an event INSERT holding a row of this trace id
 	badCommit map[string]bool
 	gate      chan struct{}
 }
@@ -104,8 +105,12 @@ func (t *probeTx) QueryRow(ctx context.Context, q string, args ...any) trace.Row
 	return t.inner.QueryRow(ctx, q, args...)
 }
 
-// newTraceCols is the placeholders per row of the writer's new-trace INSERT.
-const newTraceCols = 14
+// newTraceCols and eventCols are the placeholders per row of the writer's
+// new-trace and event INSERTs.
+const (
+	newTraceCols = 14
+	eventCols    = 12
+)
 
 func (t *probeTx) Query(ctx context.Context, q string, args ...any) (trace.Rows, error) {
 	qr, ok := t.inner.(trace.Querier)
@@ -148,6 +153,13 @@ func (r *countedRows) Next() bool {
 
 func (t *probeTx) Exec(ctx context.Context, q string, args ...any) error {
 	t.stmts++
+	if strings.HasPrefix(q, "INSERT INTO mvp_trace_event") {
+		for i := 1; i < len(args); i += eventCols {
+			if t.db.badEvent[args[i].(string)] {
+				return errBadValue
+			}
+		}
+	}
 	if strings.HasPrefix(q, "UPDATE mvp_trace") && (t.db.badWrite[args[13].(string)] || t.db.badUpdate[args[13].(string)]) {
 		return errBadValue
 	}
@@ -626,6 +638,52 @@ func TestOneBadNewTraceCostsTheBatchOneRetry(t *testing.T) {
 		}
 		if c.TracesWritten.Load() != 63 || c.WriteError.Load() != 1 || len(dbtest.ReadTraces(t, h.SQL)) != 63 {
 			t.Fatalf("traces_written=%d write_error=%d, want 63 / 1", c.TracesWritten.Load(), c.WriteError.Load())
+		}
+	})
+}
+
+// TestManyBadNewTracesStayPerGroup: when every group of a batch is bad, the
+// batch leaves the multi-row path after its second failure there, so it
+// costs about one transaction per group, not a multi-row attempt per group.
+func TestManyBadNewTracesStayPerGroup(t *testing.T) {
+	db := &probeDB{inner: dbtest.OpenSQLite(t, false).DB(), badWrite: map[string]bool{}}
+	var groups []trace.Group
+	for i := 0; i < 64; i++ {
+		db.badWrite[traceN(i)] = true
+		groups = append(groups, rootGroup(t, traceN(i), mkSpanTrace(t, "workspace-7", traceN(i), sid(0), "", "query_execute", 0, 0)))
+	}
+	c := &trace.Counters{}
+	if err := trace.NewWriter(db, trace.Config{}, c, nil).WriteBatch(context.Background(), groups); !errors.Is(err, errBadValue) {
+		t.Fatalf("err = %v", err)
+	}
+	// multi fails, per group drops 0; multi fails again, per group drops 1;
+	// then per group drops each of the other 62: 2 + 2 + 62
+	if begins, committed := db.stats(); begins != 66 || len(committed) != 0 || c.WriteError.Load() != 64 {
+		t.Fatalf("begins=%d committed=%v write_error=%d, want 66 / none / 64", begins, committed, c.WriteError.Load())
+	}
+}
+
+// TestBadEventRowIsPinnedOnItsGroup: a group whose event row fails (its
+// trace row would be stored) among 64 new ones. The batch's multi-row event
+// INSERT fails, the per-group retry inserts each group's event rows with the
+// group and pins the error there, and the batch never retries forever.
+func TestBadEventRowIsPinnedOnItsGroup(t *testing.T) {
+	dbtest.Each(t, false, func(t *testing.T, h *dbtest.Handle) {
+		var groups []trace.Group
+		for i := 0; i < 64; i++ {
+			groups = append(groups, rootGroup(t, traceN(i), mkSpanTrace(t, "workspace-7", traceN(i), sid(0), "", "query_execute", 0, 0)))
+		}
+		db := &probeDB{inner: h.DB(), badEvent: map[string]bool{traceN(30): true}}
+		c := &trace.Counters{}
+		if err := trace.NewWriter(db, trace.Config{}, c, nil).WriteBatch(context.Background(), groups); !errors.Is(err, errBadValue) {
+			t.Fatalf("err = %v", err)
+		}
+		begins, committed := db.stats()
+		if begins != 4 || len(committed) != 2 || c.TracesWritten.Load() != 63 || c.WriteError.Load() != 1 {
+			t.Fatalf("begins=%d committed=%v traces_written=%d write_error=%d, want 4 / two / 63 / 1", begins, committed, c.TracesWritten.Load(), c.WriteError.Load())
+		}
+		if rows, ev := dbtest.ReadTraces(t, h.SQL), dbtest.ReadEvents(t, h.SQL); len(rows) != 63 || len(ev) != 63 {
+			t.Fatalf("rows=%d events=%d, want 63 each", len(rows), len(ev))
 		}
 	})
 }

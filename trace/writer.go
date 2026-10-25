@@ -63,7 +63,8 @@ func (w *Writer) Write(ctx context.Context, g Group) error {
 // back, the groups before the failing one are written again on their own,
 // the failing group is dropped (write_error) and the rest carry on. A data
 // error in a multi-row statement, which holds several groups' rows, retries
-// the batch once on the per-group path, which pins it on its group. A data
+// the batch on the per-group path, which pins it on its group (after a
+// second such error the rest of the batch stays per group). A data
 // error that cannot be pinned on one group (a failed commit) writes each
 // group in its own transaction. A transient error or a missing table retries
 // the whole batch with backoff until ctx ends, and then every group still
@@ -74,6 +75,7 @@ func (w *Writer) WriteBatch(ctx context.Context, groups []Group) error {
 	var errs []error
 	delay := backoffStart
 	perGroup := false // the next attempt takes the per-group path
+	multiFailed := 0  // data errors in this batch's multi-row statements
 	for len(pending) > 0 {
 		if cerr := ctx.Err(); cerr != nil {
 			errs = append(errs, w.abandon(pending, cerr, nil))
@@ -98,13 +100,17 @@ func (w *Writer) WriteBatch(ctx context.Context, groups []Group) error {
 			kind = w.db.Classify(err)
 		}
 		if kind == ErrData {
-			if failed == failedMultiRow && len(pending) > 1 {
+			if failed == failedMultiRow && len(pending) > 1 && !perGroup {
 				// One bad row costs the batch its multi-row statements once:
 				// the per-group path names the group it belongs to.
+				multiFailed++
 				perGroup = true
 				continue
 			}
-			perGroup = false
+			// After the pinned drop the rest goes back to the multi-row path,
+			// unless it failed there twice: a batch of many bad groups then
+			// stays per group, one transaction per bad group.
+			perGroup = multiFailed >= 2
 			if failed < 0 && len(pending) > 1 {
 				for _, g := range pending {
 					if gerr := w.WriteBatch(ctx, []Group{g}); gerr != nil {

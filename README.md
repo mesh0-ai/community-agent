@@ -106,8 +106,9 @@ never waits for a batch to fill. The stored rows are the same either way: each
 group is merged in order, and a later group for the same trace sees the earlier
 one's writes. A data error drops only its own group: the batch is rolled back,
 the groups before it are written again, and the rest carry on (an error in a
-multi-row statement, which no single group owns, retries the batch once with
-one upsert and update per group, which pins it). A transient error or a
+multi-row statement, which no single group owns, retries the batch with one
+upsert and update per group, which pins it; after a second such error the
+rest of the batch stays per group). A transient error or a
 missing table retries the whole batch.
 
 To drive it synchronously instead (tests, a single-threaded host), use
