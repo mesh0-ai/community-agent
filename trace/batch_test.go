@@ -222,9 +222,9 @@ func rootGroup(_ *testing.T, traceID string, spans ...trace.Span) trace.Group {
 // is written at most twice (once in the failed attempt, once for real).
 //
 // With new keys the bad rows sit in the batch's one new-trace INSERT, which
-// no single group owns, so each group is then written on its own. With keys
-// that already have a row every group is merged with its own UPDATE, and the
-// error is pinned on the failing group.
+// no single group owns, so the batch is retried on the per-group path, which
+// pins the error on its group. With keys that already have a row every group
+// is merged with its own UPDATE, and the error is pinned at once.
 func TestBatchDataErrorDropsOnlyThatGroup(t *testing.T) {
 	for _, existing := range []bool{false, true} {
 		t.Run(map[bool]string{false: "new keys", true: "existing keys"}[existing], func(t *testing.T) {
@@ -290,10 +290,11 @@ func TestBatchDataErrorDropsOnlyThatGroup(t *testing.T) {
 					if begins != 5 || len(committed) != 3 {
 						t.Fatalf("begins=%d committed=%v, want 5 begins and 3 commits", begins, committed)
 					}
-				} else if begins != 6 || len(committed) != 3 {
-					// attempt [g1 b1 g2 b2 g1'] fails in the new-trace INSERT -> one by one:
-					// [g1] [b1 fails] [g2] [b2 fails] [g1']
-					t.Fatalf("begins=%d committed=%v, want 6 begins and 3 commits", begins, committed)
+				} else if begins != 7 || len(committed) != 3 {
+					// attempt [g1 b1 g2 b2 g1'] fails in the new-trace INSERT -> again per group,
+					// fails at b1 -> [g1] committed; [g2 b2 g1'] fails in the INSERT -> per group,
+					// fails at b2 -> [g2] committed; [g1'] committed.
+					t.Fatalf("begins=%d committed=%v, want 7 begins and 3 commits", begins, committed)
 				}
 			})
 		})
@@ -598,6 +599,33 @@ func TestBatchRealDriverDataErrorInNewTraces(t *testing.T) {
 			}
 		} else if err != nil || begins != 1 || c.TracesWritten.Load() != 3 {
 			t.Fatalf("sqlite stores the NUL: err=%v begins=%d traces_written=%d, want nil / 1 / 3", err, begins, c.TracesWritten.Load())
+		}
+	})
+}
+
+// TestOneBadNewTraceCostsTheBatchOneRetry: one bad group among 64 new ones
+// fails the batch's multi-row INSERT. The batch is retried once on the
+// per-group path, which pins the bad group; the groups before it and after
+// it are then written in one transaction each. Four transactions, not one
+// per group.
+func TestOneBadNewTraceCostsTheBatchOneRetry(t *testing.T) {
+	dbtest.Each(t, false, func(t *testing.T, h *dbtest.Handle) {
+		var groups []trace.Group
+		for i := 0; i < 64; i++ {
+			groups = append(groups, rootGroup(t, traceN(i), mkSpanTrace(t, "workspace-7", traceN(i), sid(0), "", "query_execute", 0, 0)))
+		}
+		db := &probeDB{inner: h.DB(), badWrite: map[string]bool{traceN(30): true}}
+		c := &trace.Counters{}
+		if err := trace.NewWriter(db, trace.Config{}, c, nil).WriteBatch(context.Background(), groups); !errors.Is(err, errBadValue) {
+			t.Fatalf("err = %v", err)
+		}
+		// [0..63] fails in the INSERT; per group, fails at 30; [0..29]; [31..63]
+		begins, committed := db.stats()
+		if begins != 4 || len(committed) != 2 || committed[0] != 30 || committed[1] != 33 {
+			t.Fatalf("begins=%d committed=%v, want 4 begins and [30 33]", begins, committed)
+		}
+		if c.TracesWritten.Load() != 63 || c.WriteError.Load() != 1 || len(dbtest.ReadTraces(t, h.SQL)) != 63 {
+			t.Fatalf("traces_written=%d write_error=%d, want 63 / 1", c.TracesWritten.Load(), c.WriteError.Load())
 		}
 	})
 }

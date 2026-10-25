@@ -62,6 +62,8 @@ func (w *Writer) Write(ctx context.Context, g Group) error {
 // One group's data error does not cost the others: the batch is rolled
 // back, the groups before the failing one are written again on their own,
 // the failing group is dropped (write_error) and the rest carry on. A data
+// error in a multi-row statement, which holds several groups' rows, retries
+// the batch once on the per-group path, which pins it on its group. A data
 // error that cannot be pinned on one group (a failed commit) writes each
 // group in its own transaction. A transient error or a missing table retries
 // the whole batch with backoff until ctx ends, and then every group still
@@ -71,12 +73,13 @@ func (w *Writer) WriteBatch(ctx context.Context, groups []Group) error {
 	pending := append([]Group(nil), groups...)
 	var errs []error
 	delay := backoffStart
+	perGroup := false // the next attempt takes the per-group path
 	for len(pending) > 0 {
 		if cerr := ctx.Err(); cerr != nil {
 			errs = append(errs, w.abandon(pending, cerr, nil))
 			break
 		}
-		results, failed, err := w.writeBatchOnce(ctx, pending)
+		results, failed, err := w.writeBatchOnce(ctx, pending, !perGroup)
 		if err == nil {
 			for _, res := range results {
 				w.counters.TracesWritten.Add(1)
@@ -95,6 +98,13 @@ func (w *Writer) WriteBatch(ctx context.Context, groups []Group) error {
 			kind = w.db.Classify(err)
 		}
 		if kind == ErrData {
+			if failed == failedMultiRow && len(pending) > 1 {
+				// One bad row costs the batch its multi-row statements once:
+				// the per-group path names the group it belongs to.
+				perGroup = true
+				continue
+			}
+			perGroup = false
 			if failed < 0 && len(pending) > 1 {
 				for _, g := range pending {
 					if gerr := w.WriteBatch(ctx, []Group{g}); gerr != nil {
@@ -159,13 +169,22 @@ type writeResult struct {
 	added []Span
 }
 
+// failedMultiRow is writeBatchOnce's failed index for an error in a
+// multi-row statement, which holds several groups' rows.
+const failedMultiRow = -2
+
 // writeBatchOnce writes groups in one transaction. On error, failed is the
-// index of the group whose statement failed, or -1 when the error is not
-// one group's (Begin, Commit, a multi-row statement).
+// index of the group whose statement failed, failedMultiRow for a
+// multi-row statement, or -1 when the error is no statement's (Begin,
+// Commit).
 //
-// It runs as few statements as the merge allows. With a Querier, the first
-// group of each key in the batch is merged into an empty row and all of
-// them are offered to one multi-row INSERT ... ON CONFLICT DO NOTHING; the
+// multi false is the per-group path: every group upserted, updated and its
+// event rows inserted in turn, so any statement's error is its group's. It
+// is also the path of a Tx without a Querier.
+//
+// With multi and a Querier it runs as few statements as the merge allows:
+// the first group of each key in the batch is merged into an empty row and
+// all of them are offered to one multi-row INSERT ... ON CONFLICT DO NOTHING; the
 // keys it returns are stored, whole, with no read. Every other group (a key
 // that already had a row, or a later group for a key earlier in the batch)
 // is merged into its stored row with the upsert and update, in batch order.
@@ -174,7 +193,7 @@ type writeResult struct {
 // instead of three statements of its own, and the rows are the same as
 // writing the groups one by one: a key is either new, and its merge into an
 // empty row is what the upsert would have read, or it goes the old way.
-func (w *Writer) writeBatchOnce(ctx context.Context, groups []Group) (results []writeResult, failed int, err error) {
+func (w *Writer) writeBatchOnce(ctx context.Context, groups []Group, multi bool) (results []writeResult, failed int, err error) {
 	tx, err := w.db.Begin(ctx)
 	if err != nil {
 		return nil, -1, err
@@ -187,9 +206,11 @@ func (w *Writer) writeBatchOnce(ctx context.Context, groups []Group) (results []
 	}()
 	results = make([]writeResult, len(groups))
 	inserted := make([]bool, len(groups))
-	if q, ok := tx.(Querier); ok {
-		if i, err := w.insertNewTraces(ctx, q, groups, inserted, results); err != nil {
-			return nil, i, err
+	q, ok := tx.(Querier)
+	multi = multi && ok
+	if multi {
+		if err := w.insertNewTraces(ctx, q, groups, inserted, results); err != nil {
+			return nil, failedMultiRow, err
 		}
 	}
 	var events []eventRow
@@ -203,10 +224,16 @@ func (w *Writer) writeBatchOnce(ctx context.Context, groups []Group) (results []
 			return nil, i, err
 		}
 		results[i] = res
+		if !multi {
+			if err := insertEvents(ctx, tx, appendEvents(nil, g, res.added)); err != nil {
+				return nil, i, err
+			}
+			continue
+		}
 		events = appendEvents(events, g, res.added)
 	}
 	if err := insertEvents(ctx, tx, events); err != nil {
-		return nil, -1, err
+		return nil, failedMultiRow, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, -1, err
@@ -285,9 +312,8 @@ func (w *Writer) merge(existing []json.RawMessage, byteCount, dropped int64, g G
 // insertNewTraces offers the first group of each key in groups to
 // sqlInsertNewTraces, each merged into an empty row, and marks inserted[i]
 // (with results[i]) for every group whose key the INSERT returned. An error
-// is no single group's (-1): WriteBatch then writes each group on its own,
-// where a failing group is the batch's only one.
-func (w *Writer) insertNewTraces(ctx context.Context, q Querier, groups []Group, inserted []bool, results []writeResult) (int, error) {
+// is no single group's: WriteBatch then retries on the per-group path.
+func (w *Writer) insertNewTraces(ctx context.Context, q Querier, groups []Group, inserted []bool, results []writeResult) error {
 	first := make(map[Key]int, len(groups))
 	var idx []int
 	for i, g := range groups {
@@ -305,7 +331,7 @@ func (w *Writer) insertNewTraces(ctx context.Context, q Querier, groups []Group,
 			g := groups[i]
 			m, err := w.merge(nil, 0, 0, g) // no stored spans to read: cannot fail
 			if err != nil {
-				return -1, err
+				return err
 			}
 			rows[i] = m
 			a := m.root.attrs
@@ -334,10 +360,10 @@ func (w *Writer) insertNewTraces(ctx context.Context, q Querier, groups []Group,
 			}()
 		}
 		if err != nil {
-			return -1, err
+			return err
 		}
 	}
-	return -1, nil
+	return nil
 }
 
 // eventRow is one mvp_trace_event row to insert: a span and its key.
@@ -358,7 +384,6 @@ func appendEvents(events []eventRow, g Group, added []Span) []eventRow {
 }
 
 // insertEvents inserts events, up to maxRowsPerStatement rows per statement.
-// An error is no single group's, as in insertNewTraces.
 func insertEvents(ctx context.Context, tx Tx, events []eventRow) error {
 	for start := 0; start < len(events); start += maxRowsPerStatement {
 		chunk := events[start:min(start+maxRowsPerStatement, len(events))]
