@@ -551,3 +551,53 @@ func TestBatchRealDriverDataErrorMatchesOneByOne(t *testing.T) {
 		}
 	})
 }
+
+// TestBatchRealDriverDataErrorInNewTraces: the NUL span of
+// TestBatchRealDriverDataErrorMatchesOneByOne in a NEW key's group, so it
+// sits in the batch's multi-row new-trace INSERT beside two good new keys.
+// On Postgres that statement fails (22P05) and aborts the transaction, no
+// single group owns it, and each group is then written on its own: the good
+// ones stored, the bad one dropped. SQLite stores it. Either way the rows are
+// what writing the groups one by one gives.
+func TestBatchRealDriverDataErrorInNewTraces(t *testing.T) {
+	a, bad, b := traceN(1), traceN(2), traceN(3)
+	body := fmt.Sprintf(`{"timestamp":"2026-10-13T09:50:00.000Z","trace_id":%q,"span_id":%q,"attributes":{"event_name":"query_execute","status":"success"},"data":{"pad":"a\u0000b"}}`, bad, sid(0))
+	nul, err := trace.DecodeSpan("workspace-7", []byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups := []trace.Group{
+		rootGroup(t, a, mkSpanTrace(t, "workspace-7", a, sid(0), "", "query_execute", 0, 0)),
+		rootGroup(t, bad, nul),
+		rootGroup(t, b, mkSpanTrace(t, "workspace-7", b, sid(0), "", "query_execute", 0, 0)),
+	}
+	dbtest.Each(t, false, func(t *testing.T, h *dbtest.Handle) {
+		oracle := dbtest.OpenSQLite(t, false)
+		if h.Name == "postgres" {
+			oracle = dbtest.OpenPostgres(t, false)
+		}
+		ow := trace.NewWriter(oracle.DB(), trace.Config{}, &trace.Counters{}, nil)
+		for _, g := range groups {
+			_ = ow.Write(context.Background(), g)
+		}
+		db := &probeDB{inner: h.DB()}
+		c := &trace.Counters{}
+		err := trace.NewWriter(db, trace.Config{}, c, nil).WriteBatch(context.Background(), groups)
+		if got, want := dbtest.Canonical(t, dbtest.ReadTraces(t, h.SQL)), dbtest.Canonical(t, dbtest.ReadTraces(t, oracle.SQL)); got != want {
+			t.Fatalf("mvp_trace differs from one by one\n got: %s\nwant: %s", got, want)
+		}
+		if got, want := dbtest.Canonical(t, dbtest.ReadEvents(t, h.SQL)), dbtest.Canonical(t, dbtest.ReadEvents(t, oracle.SQL)); got != want {
+			t.Fatalf("mvp_trace_event differs from one by one\n got: %s\nwant: %s", got, want)
+		}
+		begins, committed := db.stats()
+		if h.Name == "postgres" {
+			// [a bad b] fails in the new-trace INSERT -> [a] [bad fails] [b]
+			if err == nil || c.WriteError.Load() != 1 || c.TracesWritten.Load() != 2 || begins != 4 || len(committed) != 2 {
+				t.Fatalf("err=%v write_error=%d traces_written=%d begins=%d committed=%v, want an error, 1, 2, 4, two commits",
+					err, c.WriteError.Load(), c.TracesWritten.Load(), begins, committed)
+			}
+		} else if err != nil || begins != 1 || c.TracesWritten.Load() != 3 {
+			t.Fatalf("sqlite stores the NUL: err=%v begins=%d traces_written=%d, want nil / 1 / 3", err, begins, c.TracesWritten.Load())
+		}
+	})
+}
